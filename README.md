@@ -4,6 +4,8 @@ A Claude Code plugin and a standalone CLI (`utcourts`) for UT Austin RecSports c
 
 Everyone signs in with their own UT EID. Nothing is shared between people.
 
+![utcourts: check open tennis courts, book one, see it in your reservations](demo/demo.gif)
+
 ## Install (for anyone)
 
 **As a Claude Code plugin** (gives you the `/ut-recsports:courts` skill):
@@ -38,9 +40,24 @@ utcourts cancel 1                              or: utcourts cancel --match "11/1
 utcourts help book                             details for any command
 ```
 
-`book` and `cancel` always show exactly what they're about to do and ask `[y/N]`. Afterward they re-check the site to confirm it worked. `--dry-run` shows what would happen without doing it. Scripts and agents have no prompt, so they must pass `--yes`.
+`book` and `cancel` always show exactly what they're about to do and ask `[y/N]`. Afterward they re-check the site to confirm it worked. `--dry-run` shows what would happen without doing it.
 
-Exit codes: `0` ok · `1` bad input · `2` needs a fresh sign-in · `3` network trouble or page changed · `4` nothing done (not open, not confirmed, ambiguous, or RecSports said no).
+```
+$ utcourts squash tomorrow --after 8pm
+Squash · Tomorrow, Wed Nov 18 · from 8 PM
+
+  BEL Squash  bel-squash
+     8 PM  932
+     9 PM  932
+
+  GRE Squash  gre-squash
+     9 PM  B
+    10 PM  A  B
+
+Book one: utcourts book bel-squash tomorrow 8pm --court 932
+```
+
+Commands also take `--json`, for scripts and agents.
 
 ## How it avoids logging in all the time
 
@@ -61,6 +78,7 @@ plugins/ut-recsports/.claude-plugin/plugin.json
 plugins/ut-recsports/skills/courts/SKILL.md  the skill (CLI route + Claude in Chrome route)
 plugins/ut-recsports/skills/courts/scripts/utcourts.py   the CLI, one file
 tests/                                       mock RecSports + UT SSO, and the test suite
+demo/demo.tape                               the demo above (`vhs demo/demo.tape`; books a real court)
 ```
 
 To use the skill in just one repo without a plugin, copy `plugins/ut-recsports/skills/courts/` to `<that repo>/.claude/skills/courts/` and commit it.
@@ -70,7 +88,8 @@ To use the skill in just one repo without a plugin, copy `plugins/ut-recsports/s
 The suite needs the Python packages and Playwright's own Chromium: `pip install httpx beautifulsoup4 playwright && python3 -m playwright install chromium`.
 
 ```bash
-python3 tests/run_tests.py                         # 82 checks against a mock RecSports + UT SSO
+python3 tests/run_tests.py                         # 93 checks against a mock RecSports + UT SSO
+UTCOURTS_BROWSER=chrome python3 tests/run_tests.py # same, with your installed Chrome
 xvfb-run -a python3 tests/test_login_window.py     # the visible sign-in window (Linux)
 claude plugin validate .                           # marketplace + plugin manifests
 ```

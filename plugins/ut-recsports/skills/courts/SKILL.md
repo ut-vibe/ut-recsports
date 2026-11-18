@@ -14,7 +14,8 @@ Pick the route that matches your tools.
 
 ## Route A: a shell on the person's computer (Claude Code)
 
-Run the bundled CLI. Always pass `--json --no-login` so it never blocks on a window:
+Run the bundled CLI. Always pass `--json --no-login` (every command except `login`/`logout` takes
+both) so it never blocks on a window and you get stable JSON instead of the human layout:
 
 ```bash
 uv run "${CLAUDE_SKILL_DIR}/scripts/utcourts.py" <command> ... --json --no-login
@@ -53,10 +54,25 @@ No `uv`? Use `python3 "${CLAUDE_SKILL_DIR}/scripts/utcourts.py"` after
    `failed`, `unclear`, `not_found`, or `unsupported` (that reservation's cancel button runs page
    JavaScript; send the person to the My Reservations page).
 
+### Status
+`status --json --no-login` returns `{"signed_in": true|false, "saved_at": "..."}`.
+
 ### Exit codes and signing in
-- `0` ok · `1` bad input (fix the arguments) · `3` network trouble or the page changed.
-- `4`: nothing was done (not open, ambiguous, not confirmed, or RecSports said no). Read the JSON.
-- `2`: needs a fresh UT sign-in. Tell the person a Chrome window is about to open for their EID and Duo, then run `uv run "${CLAUDE_SKILL_DIR}/scripts/utcourts.py" login` (no `--json`; it waits up to 5 minutes). Then retry.
+The human output never mentions these; they're for you.
+
+| code | meaning | what to do |
+|---|---|---|
+| `0` | ok | |
+| `1` | bad input: unknown word, bad date/time, unknown option | fix the arguments; stderr has a `✗` line and a hint |
+| `2` | needs a fresh UT sign-in | see below |
+| `3` | network trouble, or the RecSports page changed | retry once; then tell the person |
+| `4` | nothing was done: not open, ambiguous, not confirmed, or RecSports said no | read the JSON `status` |
+
+On `2`: tell the person a Chrome window is about to open for their EID and Duo, then run
+`uv run "${CLAUDE_SKILL_DIR}/scripts/utcourts.py" login` (no `--json`; it waits up to 5 minutes). Then retry.
+
+Without a terminal, `book` and `cancel` never prompt: they stop with `not_confirmed` unless you pass
+`--yes`, which you only do after the person said yes to that exact slot or reservation.
 
 Each person signs in with their own EID. Sessions are saved per user in `~/.config/utcourts/`.
 

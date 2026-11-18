@@ -32,11 +32,12 @@ How the "don't make me log in all the time" part works
   logs back in on its own and the check just continues. You only get asked
   to sign in again when UT's SSO / Duo has fully expired.
 
-Exit codes: 0 ok · 1 usage/other error · 2 sign-in needed · 3 page changed / network trouble
+Human output goes to the terminal; `--json` output and exit codes are for scripts
+and agents (documented in SKILL.md next to this script).
 """
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
 import json
@@ -44,11 +45,12 @@ import os
 import re
 import shutil
 import sys
-import textwrap
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from datetime import date, datetime, timedelta
+from itertools import groupby
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import urljoin, urlparse, parse_qs
@@ -86,19 +88,24 @@ DEFAULT_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.3
 class Facility:
     id: int
     sports: tuple[str, ...]
-    name: str
-    aliases: tuple[str, ...]
+    name: str                  # as RecSports names it (used in --json)
+    aliases: tuple[str, ...]   # short names you can type; the first is the main one
+    short: str                 # display name in human output
 
 
 FACILITIES: list[Facility] = [
-    Facility(28, ("squash",), "Bellmont Hall (BEL) - Squash", ("bel-squash", "bel")),
-    Facility(30, ("pickleball",), "Caven-Clark Courts (CCF) - Pickleball Only", ("ccf-pickleball", "ccf")),
-    Facility(35, ("racquetball",), "Gregory Gym (GRE) - Racquetball / Handball", ("gre-rb", "gre-racquetball", "gre-handball")),
-    Facility(40, ("squash",), "Gregory Gym (GRE) - Squash", ("gre-squash",)),
-    Facility(55, ("squash",), "Recreational Sports Center (RSC) - Squash", ("rsc-squash",)),
-    Facility(50, ("racquetball",), "Recreational Sports Center (RSC) - Racquetball / Handball", ("rsc-rb", "rsc-racquetball", "rsc-handball")),
-    Facility(60, ("tennis",), "Whitaker Courts (WC) - Tennis Only", ("wc-tennis",)),
-    Facility(65, ("pickleball", "tennis"), "Whitaker Courts (WC) - Pickleball / Tennis", ("wc-pickleball", "wc-mixed", "wc")),
+    Facility(28, ("squash",), "Bellmont Hall (BEL) - Squash", ("bel-squash", "bel"), "BEL Squash"),
+    Facility(30, ("pickleball",), "Caven-Clark Courts (CCF) - Pickleball Only", ("ccf-pickleball", "ccf"),
+             "CCF Pickleball"),
+    Facility(35, ("racquetball",), "Gregory Gym (GRE) - Racquetball / Handball",
+             ("gre-rb", "gre-racquetball", "gre-handball"), "GRE Racquetball/Handball"),
+    Facility(40, ("squash",), "Gregory Gym (GRE) - Squash", ("gre-squash",), "GRE Squash"),
+    Facility(55, ("squash",), "Recreational Sports Center (RSC) - Squash", ("rsc-squash",), "RSC Squash"),
+    Facility(50, ("racquetball",), "Recreational Sports Center (RSC) - Racquetball / Handball",
+             ("rsc-rb", "rsc-racquetball", "rsc-handball"), "RSC Racquetball/Handball"),
+    Facility(60, ("tennis",), "Whitaker Courts (WC) - Tennis Only", ("wc-tennis",), "Whitaker Tennis"),
+    Facility(65, ("pickleball", "tennis"), "Whitaker Courts (WC) - Pickleball / Tennis",
+             ("wc-pickleball", "wc-mixed", "wc"), "Whitaker Pickleball/Tennis"),
 ]
 FAC_BY_ID = {f.id: f for f in FACILITIES}
 
@@ -110,37 +117,140 @@ SPORT_ALIASES = {
     "tennis": "tennis", "tn": "tennis",
 }
 
-STATUS_SYMBOL = {
-    "open": "✓", "reserved": "·", "event": "E", "priority": "P",
-    "closed": "×", "yours": "★", "unavailable": "-",
-}
-LEGEND = "✓ open  · reserved  E event  P faculty/staff priority  × closed  ★ yours  - other"
-
-
 # --------------------------------------------------------------------------- #
 # Errors
 # --------------------------------------------------------------------------- #
 class UTCourtsError(Exception):
+    """A problem to show the person: the message, plus an optional hint on what to do."""
     exit_code = 1
+    default_hint: str | None = None
+
+    def __init__(self, message: str = "", hint: str | None = None):
+        super().__init__(message)
+        self.hint = hint if hint is not None else self.default_hint
 
 
 class SignInNeeded(UTCourtsError):
     exit_code = 2
+    default_hint = "Run utcourts login to sign in with your EID + Duo."
 
 
 class PageChanged(UTCourtsError):
     exit_code = 3
+    default_hint = "RecSports may have changed its pages; utcourts may need an update."
 
 
 class NetworkTrouble(UTCourtsError):
     exit_code = 3
+    default_hint = "Check your connection and try again."
+
+
+# --------------------------------------------------------------------------- #
+# Terminal output: colors, a spinner, stderr logging
+# --------------------------------------------------------------------------- #
+def _color_on(stream) -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR") or os.environ.get("CLICOLOR_FORCE"):
+        return True
+    try:
+        return stream.isatty() and os.environ.get("TERM") != "dumb"
+    except (AttributeError, ValueError):
+        return False
+
+
+class Paint:
+    """p = Paint(sys.stdout); p("text", "bold", "green"). Plain text unless that stream is a terminal."""
+    CODES = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33",
+             "blue": "34", "magenta": "35", "cyan": "36"}
+
+    def __init__(self, stream=None):
+        self.on = _color_on(stream if stream is not None else sys.stdout)
+
+    def __call__(self, text: str, *styles: str) -> str:
+        if not self.on or not styles or not text:
+            return text
+        return "".join(f"\033[{self.CODES[s]}m" for s in styles) + text + "\033[0m"
+
+    def ok(self, text: str) -> str:
+        return f"{self('✓', 'green', 'bold')} {text}"
+
+    def bad(self, text: str) -> str:
+        return f"{self('✗', 'red', 'bold')} {text}"
+
+    def warn(self, text: str) -> str:
+        return f"{self('!', 'yellow', 'bold')} {text}"
+
+    def note(self, text: str) -> str:
+        return f"{self('›', 'cyan', 'bold')} {text}"
+
+
+class Spinner:
+    """`with Spinner("Checking…"):` shows a spinner on stderr while waiting (terminals only).
+    log() prints above it; Spinner.say() changes its text."""
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    current: "Spinner | None" = None
+
+    def __init__(self, text: str, enabled: bool = True):
+        self.text = text
+        try:
+            tty = sys.stderr.isatty()
+        except (AttributeError, ValueError):
+            tty = False
+        self.enabled = enabled and tty and os.environ.get("TERM") != "dumb" and Spinner.current is None
+        self.lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "Spinner":
+        if self.enabled:
+            Spinner.current = self
+            self._thread = threading.Thread(target=self._spin, daemon=True)
+            self._thread.start()
+        return self
+
+    def _spin(self) -> None:
+        p = Paint(sys.stderr)
+        i = 0
+        while not self._stop.wait(0.08):
+            with self.lock:
+                sys.stderr.write(f"\r\033[2K{p(self.FRAMES[i % len(self.FRAMES)], 'cyan')} {p(self.text, 'dim')}")
+                sys.stderr.flush()
+            i += 1
+
+    def __exit__(self, *exc) -> bool:
+        if self.enabled:
+            self._stop.set()
+            if self._thread:
+                self._thread.join()
+            with self.lock:
+                sys.stderr.write("\r\033[2K")
+                sys.stderr.flush()
+            Spinner.current = None
+        return False
+
+    @staticmethod
+    def say(text: str) -> bool:
+        """Change the running spinner's text. False if no spinner is showing."""
+        if Spinner.current is None:
+            return False
+        Spinner.current.text = text
+        return True
+
+
+def log(msg: str) -> None:
+    sp = Spinner.current
+    if sp is None:
+        print(msg, file=sys.stderr, flush=True)
+        return
+    with sp.lock:
+        sys.stderr.write("\r\033[2K" + msg + "\n")
+        sys.stderr.flush()
 
 
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
-def log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
 
 
 def austin_today() -> date:
@@ -178,8 +288,11 @@ def parse_date(text: str, today: date | None = None) -> date | None:
                 d = date(year + 1, d.month, d.day)
             return d
     except ValueError as e:
-        raise UTCourtsError(f"{text!r} isn't a real date ({e})") from e
+        raise UTCourtsError(f"“{text}” isn't a real date.") from e
     return None
+
+
+TIME_HINT = "Try 9pm, 9:30pm or 21:00."
 
 
 def parse_clock(text: str) -> int:
@@ -187,14 +300,14 @@ def parse_clock(text: str) -> int:
     t = text.strip().lower().replace(" ", "").replace(".", "")
     m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?(am|pm|a|p)?", t)
     if not m:
-        raise UTCourtsError(f"Couldn't read the time {text!r} (try 17, 17:30 or 5pm)")
+        raise UTCourtsError(f"Couldn't read the time “{text}”", hint=TIME_HINT)
     h, mins, ampm = int(m[1]), int(m[2] or 0), m[3]
     if ampm:
         if not 1 <= h <= 12:
-            raise UTCourtsError(f"Couldn't read the time {text!r}")
+            raise UTCourtsError(f"Couldn't read the time “{text}”", hint=TIME_HINT)
         h = h % 12 + (12 if ampm.startswith("p") else 0)
     if not (0 <= h <= 24 and 0 <= mins < 60):
-        raise UTCourtsError(f"Couldn't read the time {text!r}")
+        raise UTCourtsError(f"Couldn't read the time “{text}”", hint=TIME_HINT)
     return h * 60 + mins
 
 
@@ -225,7 +338,7 @@ def resolve_facilities(terms: Iterable[str]) -> list[Facility]:
         else:
             hits = [f for f in FACILITIES if t in f.aliases]
         if not hits:
-            raise UTCourtsError(f"Unknown sport/facility {raw!r}. Run `utcourts facilities` to see the options.")
+            raise UTCourtsError(f"Unknown sport or facility “{raw}”", hint="See the list: utcourts facilities")
         for f in hits:
             if f not in chosen:
                 chosen.append(f)
@@ -543,20 +656,21 @@ def with_client(action, allow_login: bool):
             pass
         finally:
             client.close()
-        log("RecSports session expired — trying to sign back in quietly…")
+        msg = "RecSports session expired. Trying to sign back in quietly…"
+        if not Spinner.say(msg):
+            log(Paint(sys.stderr).note(msg))
         ok, value = browser_session(interactive=False, timeout_s=30, action=action)
         if ok:
-            log("Signed back in.")
             return value
     elif PROFILE_DIR.exists():
         ok, value = browser_session(interactive=False, timeout_s=30, action=action)
         if ok:
             return value
     elif not allow_login:
-        raise SignInNeeded("Not signed in yet. Run `utcourts login` once.")
+        raise SignInNeeded("Not signed in yet.")
     if allow_login:
         return interactive_login(action)
-    raise SignInNeeded("UT sign-in has expired. Run `utcourts login` (needs your EID + Duo).")
+    raise SignInNeeded("Your UT sign-in has expired.")
 
 
 def get_results(jobs: list[tuple[date, int]], allow_login: bool) -> list[DayResult]:
@@ -584,11 +698,12 @@ def _launch(pw, headless: bool):
         except Exception as e:  # browser missing / profile locked / ...
             last = e
             if "ProcessSingleton" in str(e) or "SingletonLock" in str(e) or "already in use" in str(e):
-                raise UTCourtsError("The utcourts browser profile is already open (another `utcourts login` running?).") from e
+                raise UTCourtsError("The utcourts browser profile is already in use.",
+                                    hint="Is another utcourts login window still open?") from e
     raise UTCourtsError(
-        "Couldn't start a browser for sign-in. Install Google Chrome, or run:\n"
-        "    uvx playwright install chromium\n"
-        f"(last error: {str(last).splitlines()[0] if last else 'unknown'})")
+        "Couldn't start a browser for sign-in.",
+        hint="Install Google Chrome, or run: uvx playwright install chromium\n"
+             f"({str(last).splitlines()[0] if last else 'unknown error'})")
 
 
 _PW_COOKIE_KEYS = ("name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite")
@@ -641,8 +756,8 @@ def browser_session(interactive: bool, timeout_s: float, action=None) -> tuple[b
     try:
         from playwright.sync_api import sync_playwright, Error as PWError
     except ImportError as e:
-        raise UTCourtsError("Playwright isn't installed. Run via `uv run utcourts.py ...` "
-                            "or `pip install playwright`.") from e
+        raise UTCourtsError("Playwright isn't installed.",
+                            hint="Run it with uv (uv run utcourts.py …), or: pip install playwright") from e
 
     with sync_playwright() as pw:
         ctx = _launch(pw, headless=not interactive)
@@ -670,7 +785,7 @@ def browser_session(interactive: bool, timeout_s: float, action=None) -> tuple[b
             while time.monotonic() < deadline:
                 if page.is_closed():
                     if interactive:
-                        raise SignInNeeded("The sign-in window was closed before sign-in finished.")
+                        raise SignInNeeded("The sign-in window closed before sign-in finished.", hint="Run utcourts login to try again.")
                     return False, None
                 try:
                     url = page.url
@@ -711,12 +826,19 @@ def browser_session(interactive: bool, timeout_s: float, action=None) -> tuple[b
 
 
 def interactive_login(action=None):
-    log("Opening a browser window — sign in with your UT EID (and Duo).")
-    log("Tip: if Duo offers \"trust this browser\" / \"remember me\", say yes so this lasts longer.")
-    ok, value = browser_session(interactive=True, timeout_s=300, action=action)
+    e = Paint(sys.stderr)
+    log(e.note("Opening a Chrome window. Sign in there with your UT EID and Duo."))
+    log(e("  If Duo offers “Trust this browser”, say yes and you'll stay signed in longer.", "dim"))
+    waiting = "Waiting for you to sign in…"
+    if Spinner.say(waiting):
+        ok, value = browser_session(interactive=True, timeout_s=300, action=action)
+    else:
+        with Spinner(waiting):
+            ok, value = browser_session(interactive=True, timeout_s=300, action=action)
     if not ok:
-        raise SignInNeeded("Didn't see the court page within 5 minutes. Run `utcourts login` to try again.")
-    log(f"Signed in. Session saved to {SESSION_FILE}")
+        raise SignInNeeded("Didn't finish signing in within 5 minutes.", hint="Run utcourts login to try again.")
+    home = str(HOME).replace(str(Path.home()), "~", 1)
+    log(e.ok("Signed in") + e(f" · session saved in {home}", "dim"))
     return value
 
 
@@ -871,75 +993,210 @@ def send_cancel(client, r: Reservation) -> Page:
         return client.get(r.cancel_url, params=r.cancel_data)
     if r.cancel_method == "POST":
         return client.post(r.cancel_url, r.cancel_data or {})
-    raise UTCourtsError("This reservation's cancel button runs JavaScript on the page; cancel it on the website.")
+    raise UTCourtsError("This reservation can only be cancelled on the website.", hint=MINE_URL)
 
 
 # --------------------------------------------------------------------------- #
-# Output
+# Output: formatting helpers
 # --------------------------------------------------------------------------- #
-def _use_color() -> bool:
-    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def _mins(t: str) -> int:
+    """'21:00' -> 1260"""
+    return int(t[:2]) * 60 + int(t[3:])
 
 
-def _fmt_header(r: DayResult) -> str:
-    d = date.fromisoformat(r.date)
-    return f"{r.facility} — {d.strftime('%a %b')} {d.day}"
+def fmt_time(minutes: int) -> str:
+    """1260 -> '9 PM', 1290 -> '9:30 PM'"""
+    h, m = divmod(minutes, 60)
+    suffix = "PM" if 12 <= h < 24 else "AM"
+    h12 = h % 12 or 12
+    return f"{h12}:{m:02d} {suffix}" if m else f"{h12} {suffix}"
 
 
-def print_open(results: list[DayResult], after: int | None, before: int | None) -> None:
-    color = _use_color()
-    g, b, dim, reset = ("\033[32m", "\033[1m", "\033[2m", "\033[0m") if color else ("", "", "", "")
-    any_open = False
-    for r in results:
-        rows = r.open_by_time(after, before)
-        print(f"{b}{_fmt_header(r)}{reset}")
-        if not r.courts:
-            print(f"  {dim}nothing bookable left on this day{reset}")
-        elif not rows:
-            print(f"  {dim}no open courts{' in that window' if (after or before) else ''}{reset}")
-        else:
-            any_open = True
-            w = max(len(x["label"]) for x in rows)
+def fmt_day(d: date) -> str:
+    return f"{d:%a %b} {d.day}"
+
+
+def day_token(d: date) -> str:
+    """The shortest date word that `book` reads back as this day."""
+    delta = (d - austin_today()).days
+    if delta == 0:
+        return "today"
+    if delta == 1:
+        return "tomorrow"
+    if 1 < delta < 7:
+        return f"{d:%a}".lower()
+    return f"{d.month}/{d.day}"
+
+
+def time_token(t: str) -> str:
+    return fmt_time(_mins(t)).replace(" ", "").lower()
+
+
+def court_key(court: str) -> list[tuple]:
+    """Natural order: 9 before 10, B1A before B2A."""
+    return [(0, int(x)) if x.isdigit() else (1, x.lower()) for x in re.split(r"(\d+)", court) if x]
+
+
+def fac_short(facility_id: int, fallback: str) -> str:
+    f = FAC_BY_ID.get(facility_id)
+    return f.short if f else fallback
+
+
+def fac_alias(facility_id: int) -> str | None:
+    f = FAC_BY_ID.get(facility_id)
+    return f.aliases[0] if f else None
+
+
+def fac_title(p: Paint, facility_id: int, facility: str) -> str:
+    alias = fac_alias(facility_id)
+    return p(fac_short(facility_id, facility), "bold") + (f"  {p(alias, 'dim')}" if alias else "")
+
+
+def slot_desc(facility_id: int, facility: str, day_iso: str, t: str, court: str) -> str:
+    return (f"{fac_short(facility_id, facility)} · court {court} · "
+            f"{fmt_day(date.fromisoformat(day_iso))} · {fmt_time(_mins(t))}")
+
+
+def window_text(after: int | None, before: int | None) -> str | None:
+    if after is not None and before is not None:
+        return f"{fmt_time(after)} – {fmt_time(before)}"
+    if after is not None:
+        return f"from {fmt_time(after)}"
+    if before is not None:
+        return f"before {fmt_time(before)}"
+    return None
+
+
+def day_title(d: date, label: str | None = None, after: int | None = None, before: int | None = None) -> str:
+    rel = {0: "Today", 1: "Tomorrow"}.get((d - austin_today()).days)
+    parts = [label] if label else []
+    parts.append(f"{rel}, {fmt_day(d)}" if rel else fmt_day(d))
+    w = window_text(after, before)
+    if w:
+        parts.append(w)
+    return " · ".join(parts)
+
+
+SPORT_TITLES = {"squash": "Squash", "racquetball": "Racquetball & handball",
+                "pickleball": "Pickleball", "tennis": "Tennis"}
+
+
+def sport_label(facilities: list[Facility]) -> str | None:
+    ids = {f.id for f in facilities}
+    if ids == set(FAC_BY_ID):
+        return "All courts"
+    for sport, title in SPORT_TITLES.items():
+        if ids == {f.id for f in FACILITIES if sport in f.sports}:
+            return title
+    return None
+
+
+def _courts_line(p: Paint, courts: list[str]) -> str:
+    return "  ".join(p(c, "green") for c in sorted(courts, key=court_key))
+
+
+def _nothing_left(r: DayResult) -> str:
+    return ("nothing left to book today" if r.date == austin_today().isoformat()
+            else "nothing bookable this day")
+
+
+def _in_window(t: str, after: int | None, before: int | None) -> bool:
+    m = _mins(t)
+    return (after is None or m >= after) and (before is None or m < before)
+
+
+# --------------------------------------------------------------------------- #
+# Output: check
+# --------------------------------------------------------------------------- #
+def print_open(results: list[DayResult], after: int | None, before: int | None,
+               label: str | None = None) -> None:
+    p = Paint(sys.stdout)
+    out: list[str] = []
+    first: tuple[DayResult, str, str] | None = None
+    windowed = after is not None or before is not None
+    for day_iso, group in groupby(results, key=lambda r: r.date):
+        rows_by_fac = [(r, r.open_by_time(after, before)) for r in group]
+        tw = max([len(fmt_time(_mins(x["time"]))) for _, rows in rows_by_fac for x in rows] or [0])
+        if out:
+            out.append("")
+        out.append(p(day_title(date.fromisoformat(day_iso), label, after, before), "bold"))
+        empty = [r for r, rows in rows_by_fac if not rows]
+        if len(rows_by_fac) > 1 and len(empty) == len(rows_by_fac):
+            # several facilities, none open: one line, not a section each
+            today_over = all(not r.courts for r in empty) and day_iso == austin_today().isoformat()
+            out += ["", p("  " + ("Nothing left to book today" if today_over else
+                                  "No open courts" + (" in that window" if windowed else "")), "dim")]
+            continue
+        for r, rows in rows_by_fac:
+            if not rows and len(rows_by_fac) > 1:
+                continue  # summarized below
+            out += ["", "  " + fac_title(p, r.facility_id, r.facility)]
+            if not r.courts:
+                out.append(p(f"    {_nothing_left(r)}", "dim"))
+            elif not rows:
+                out.append(p("    no open courts" + (" in that window" if windowed else ""), "dim"))
             for x in rows:
-                courts = ", ".join(x["courts"])
-                n = len(x["courts"])
-                print(f"  {x['label']:>{w}}  {g}{courts}{reset}  {dim}({n} open){reset}")
-        print()
-    if not any_open:
-        print("No open courts found.")
+                out.append(f"    {fmt_time(_mins(x['time'])):>{tw}}  {_courts_line(p, x['courts'])}")
+                if first is None:
+                    first = (r, x["time"], sorted(x["courts"], key=court_key)[0])
+        if empty and len(rows_by_fac) > 1:
+            out += ["", p("  Nothing open at " + ", ".join(fac_short(r.facility_id, r.facility) for r in empty), "dim")]
+    print("\n".join(out))
+    if first and fac_alias(first[0].facility_id):
+        r, t, court = first
+        print("\n" + p(f"Book one: utcourts book {fac_alias(r.facility_id)} "
+                       f"{day_token(date.fromisoformat(r.date))} {time_token(t)} --court {court}", "dim"))
+    elif first is None and results:
+        print("\n" + p("Add --grid to see what's taken, or try another day.", "dim"))
+
+
+GRID_SYMBOL = {"open": "✓", "reserved": "·", "event": "E", "priority": "P",
+               "closed": "×", "yours": "★", "unavailable": "-"}
+GRID_STYLE = {"open": ("green", "bold"), "reserved": ("dim",), "event": ("yellow",),
+              "priority": ("magenta",), "closed": ("dim",), "yours": ("cyan", "bold"), "unavailable": ("dim",)}
+GRID_WORD = {"open": "open", "reserved": "reserved", "yours": "yours", "event": "event",
+             "priority": "faculty/staff priority", "closed": "closed", "unavailable": "other"}
 
 
 def print_grid(results: list[DayResult], after: int | None, before: int | None) -> None:
-    color = _use_color()
-    colors = {"open": "\033[32m", "yours": "\033[36m", "event": "\033[33m", "priority": "\033[35m"} if color else {}
-    reset = "\033[0m" if color else ""
+    p = Paint(sys.stdout)
+    sym = lambda st: p(GRID_SYMBOL.get(st, "?"), *GRID_STYLE.get(st, ()))  # noqa: E731
+    blocks: list[str] = []
+    seen: set[str] = set()
     for r in results:
-        print(_fmt_header(r))
-        if not r.courts:
-            print("  nothing bookable left on this day\n")
-            continue
-        cw = max(2, *(len(c) for c in r.courts)) + 1
-        print("  " + " " * 8 + "".join(c.rjust(cw) for c in r.courts))
+        lines = [f"{fac_title(p, r.facility_id, r.facility)}  "
+                 + p("· " + day_title(date.fromisoformat(r.date)), "dim")]
         by_time: dict[str, dict[str, Slot]] = {}
         for s in r.slots:
             by_time.setdefault(s.time, {})[s.court] = s
-        for t, cells in by_time.items():
-            mins = int(t[:2]) * 60 + int(t[3:])
-            if (after is not None and mins < after) or (before is not None and mins >= before):
-                continue
-            label = next(iter(cells.values())).label
-            line = f"  {label:>8}"
+        times = [t for t in by_time if _in_window(t, after, before)]
+        if not r.courts or not times:
+            lines.append(p(f"  {_nothing_left(r)}" if not r.courts else "  no slots in that window", "dim"))
+            blocks.append("\n".join(lines))
+            continue
+        tw = max(len(fmt_time(_mins(t))) for t in times)
+        cw = max(2, *(len(c) for c in r.courts)) + 1
+        lines.append(" " * (2 + tw) + p("".join(c.rjust(cw) for c in r.courts), "dim"))
+        for t in times:
+            row = f"  {fmt_time(_mins(t)):>{tw}}"
             for c in r.courts:
-                s = cells.get(c)
-                sym = STATUS_SYMBOL.get(s.status, "?") if s else " "
-                col = colors.get(s.status, "") if s else ""
-                line += " " * (cw - 1) + f"{col}{sym}{reset if col else ''}"
-            print(line)
-        events = sorted({s.detail for s in r.slots if s.status in ("event", "unavailable", "priority")})
-        if events:
-            print("  " + "; ".join(events))
-        print()
-    print(LEGEND)
+                s = by_time[t].get(c)
+                if s is None:
+                    row += " " * cw
+                else:
+                    seen.add(s.status)
+                    row += " " * (cw - 1) + sym(s.status)
+            lines.append(row)
+        named = sorted({(s.status, re.sub(r"^Event Conflict:\s*", "", s.detail)) for s in r.slots
+                        if s.status in ("event", "unavailable") and s.detail and _in_window(s.time, after, before)})
+        if named:
+            lines.append("")
+            lines += [f"  {sym(st)} {detail}" for st, detail in named]
+        blocks.append("\n".join(lines))
+    print("\n\n".join(blocks))
+    legend = [f"{sym(st)} {GRID_WORD[st]}" for st in GRID_SYMBOL if st in seen]
+    if legend:
+        print("\n" + "   ".join(legend))
 
 
 def as_json(results: list[DayResult], after: int | None, before: int | None, include_all: bool) -> str:
@@ -950,8 +1207,7 @@ def as_json(results: list[DayResult], after: int | None, before: int | None, inc
                 "open": r.open_by_time(after, before)}
         if include_all:
             item["slots"] = [{k: v for k, v in asdict(s).items() if k != "href"} for s in r.slots
-                             if (after is None or int(s.time[:2]) * 60 + int(s.time[3:]) >= after)
-                             and (before is None or int(s.time[:2]) * 60 + int(s.time[3:]) < before)]
+                             if _in_window(s.time, after, before)]
         out.append(item)
     return json.dumps({"generated_at": datetime.now(AUSTIN_TZ).isoformat(timespec="seconds"),
                        "source": COURTS_URL, "results": out}, indent=2)
@@ -960,17 +1216,21 @@ def as_json(results: list[DayResult], after: int | None, before: int | None, inc
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
+def _checking(facilities: list[Facility]) -> str:
+    return f"Checking {facilities[0].short}…" if len(facilities) == 1 else f"Checking {len(facilities)} facilities…"
+
+
 def cmd_check(args) -> int:
     today = austin_today()
     sport_terms: list[str] = list(args.sport or [])
     day: date | None = parse_date(args.date) if args.date else None
     if args.date and day is None:
-        raise UTCourtsError(f"Couldn't read the date {args.date!r}")
+        raise UTCourtsError(f"Couldn't read the date “{args.date}”", hint="Try today, tomorrow, fri, +2 or 11/20.")
     for term in args.terms:
         d = parse_date(term, today)
         if d is not None and term.lower() not in SPORT_ALIASES:
             if day is not None:
-                raise UTCourtsError("Give just one date (use --days N for a range).")
+                raise UTCourtsError("Give just one date.", hint="For a range, add --days N.")
             day = d
         else:
             sport_terms.append(term)
@@ -979,31 +1239,34 @@ def cmd_check(args) -> int:
 
     last_ok = today + timedelta(days=MAX_DAYS_AHEAD)
     if day < today:
-        raise UTCourtsError(f"{day:%a %b %d} is in the past.")
+        raise UTCourtsError(f"{fmt_day(day)} is in the past.")
     if day > last_ok:
-        raise UTCourtsError(f"RecSports only shows up to {MAX_DAYS_AHEAD} days ahead (last day: {last_ok:%a %b %d}).")
+        raise UTCourtsError(f"RecSports only lists {MAX_DAYS_AHEAD} days ahead.",
+                            hint=f"The last day you can check is {fmt_day(last_ok)}.")
     days = [day + timedelta(days=i) for i in range(max(1, args.days)) if day + timedelta(days=i) <= last_ok]
+    e = Paint(sys.stderr)
     if args.days > len(days):
-        log(f"(Only showing through {last_ok:%a %b %d} — that's as far ahead as RecSports goes.)")
+        log(e.warn(f"Showing through {fmt_day(last_ok)}, the last day RecSports lists."))
 
     after = parse_clock(args.after) if args.after else None
     before = parse_clock(args.before) if args.before else None
     jobs = [(d, f.id) for d in days for f in facilities]
-    results = get_results(jobs, allow_login=args.login and sys.stdin.isatty())
+    with Spinner(_checking(facilities), enabled=not args.json):
+        results = get_results(jobs, allow_login=args.login and sys.stdin.isatty())
 
     # Sanity check: the site clamps dates it won't show instead of erroring.
     for (d, fid), r in zip(jobs, results):
         if r.date != d.isoformat():
-            log(f"Warning: asked for {d.isoformat()} but RecSports returned {r.date}.")
+            log(e.warn(f"Asked for {fmt_day(d)}, but RecSports returned {fmt_day(date.fromisoformat(r.date))}."))
         if r.facility_id not in (fid, -1):
-            log(f"Warning: asked for facility {fid} but RecSports returned {r.facility_id}.")
+            log(e.warn(f"Asked for facility {fid}, but RecSports returned {r.facility_id}."))
 
     if args.json:
         print(as_json(results, after, before, args.all))
     elif args.grid or args.all:
         print_grid(results, after, before)
     else:
-        print_open(results, after, before)
+        print_open(results, after, before, sport_label(facilities) if sport_terms else "All courts")
     return 0
 
 
@@ -1011,31 +1274,52 @@ def cmd_login(args) -> int:
     interactive_login()
     # Make sure the quick (no-browser) path works with the saved cookies.
     try:
-        r = fetch_many([(austin_today(), 35)])[0]
-        log(f"All set — quick checks work ({r.facility}, {r.date}).")
+        with Spinner("Checking the saved session…"):
+            fetch_many([(austin_today(), 35)])
     except SignInNeeded:
-        log("Signed in, but RecSports rejected the saved cookies outside the browser. "
-            "Checks will still work; they'll just go through the hidden browser (a bit slower).")
+        e = Paint(sys.stderr)
+        log(e.warn("RecSports didn't accept the saved cookies outside the browser."))
+        log("  Checks still work; they go through a hidden browser, which is a bit slower.")
     return 0
 
 
+def _saved_at(sess: dict) -> str:
+    try:
+        t = datetime.fromisoformat(sess.get("saved_at", ""))
+    except ValueError:
+        return "?"
+    return f"{fmt_day(t.date())}, {fmt_time(t.hour * 60 + t.minute)}"
+
+
 def cmd_status(args) -> int:
+    p = Paint(sys.stdout)
     sess = load_session()
+
+    def report(signed_in: bool, text: str) -> None:
+        if args.json:
+            print(json.dumps({"signed_in": signed_in, "saved_at": (sess or {}).get("saved_at")}, indent=2))
+        elif not (args.quiet and signed_in):
+            print(text)
+
     if not sess:
-        print("Not signed in. Run `utcourts login`.")
+        report(False, p.bad("Not signed in") + "\n  Run utcourts login to sign in with your EID + Duo.")
         return 2
     try:
-        fetch_many([(austin_today(), 35)])
-        if not args.quiet:
-            print(f"Signed in (session saved {sess.get('saved_at', '?')}).")
+        with Spinner("Checking the saved session…", enabled=not args.json):
+            fetch_many([(austin_today(), 35)])
+        report(True, p.ok("Signed in") + p(f" · session saved {_saved_at(sess)}", "dim"))
         return 0
     except SignInNeeded:
-        if args.refresh and browser_session(interactive=False, timeout_s=30)[0]:
-            if not args.quiet:
-                print("Session had expired; signed back in quietly.")
-            return 0
-        print("Session expired. Run `utcourts login`." if not args.refresh
-              else "Session expired and UT SSO wants a fresh sign-in. Run `utcourts login`.")
+        if args.refresh:
+            with Spinner("Signing back in quietly…", enabled=not args.json):
+                ok = browser_session(interactive=False, timeout_s=30)[0]
+            if ok:
+                report(True, p.ok("Signed back in quietly"))
+                return 0
+            report(False, p.bad("Signed out: UT wants your EID + Duo again") + "\n  Run utcourts login.")
+        else:
+            report(False, p.bad("RecSports session expired")
+                   + "\n  Run utcourts status --refresh to sign back in quietly, or utcourts login.")
         return 2
 
 
@@ -1047,8 +1331,16 @@ def cmd_logout(args) -> int:
     if PROFILE_DIR.exists():
         shutil.rmtree(PROFILE_DIR, ignore_errors=True)
         removed = True
-    print("Removed the saved session and browser profile." if removed else "Nothing to remove.")
+    p = Paint(sys.stdout)
+    print(p.ok("Signed out") + p(" · removed the saved session and browser profile", "dim")
+          if removed else "Already signed out.")
     return 0
+
+
+FACILITY_GROUPS = [("Squash", "squash", "squash · sq"),
+                   ("Racquetball & handball", "racquetball", "racquetball · rb · handball · hb"),
+                   ("Pickleball", "pickleball", "pickleball · pb"),
+                   ("Tennis", "tennis", "tennis · tn")]
 
 
 def cmd_facilities(args) -> int:
@@ -1056,10 +1348,20 @@ def cmd_facilities(args) -> int:
         print(json.dumps([{"id": f.id, "name": f.name, "sports": list(f.sports), "aliases": list(f.aliases)}
                           for f in FACILITIES], indent=2))
         return 0
-    print(f"{'id':>3}  {'short names':<40} facility")
-    for f in FACILITIES:
-        print(f"{f.id:>3}  {', '.join(f.aliases):<40} {f.name}")
-    print("\nSports: squash (sq) · racquetball (rb, handball) · pickleball (pb) · tennis")
+    p = Paint(sys.stdout)
+    w = max(len(f.aliases[0]) for f in FACILITIES)
+    lines: list[str] = []
+    for title, sport, words in FACILITY_GROUPS:
+        if lines:
+            lines.append("")
+        lines.append(p(title, "bold") + "  " + p(words, "dim"))
+        for f in FACILITIES:
+            if sport in f.sports:
+                also = [s for s in f.sports if s != sport]
+                lines.append(f"  {f.aliases[0]:<{w}}  {f.name.split(' - ')[0]}"
+                             + (p(f" · also {', '.join(also)}", "dim") if also else ""))
+    print("\n".join(lines))
+    print("\n" + p("Use a sport word for every facility that has it, or a short name for one.", "dim"))
     return 0
 
 
@@ -1089,6 +1391,9 @@ def _is_facility_word(t: str) -> bool:
             or (t.isdigit() and int(t) in FAC_BY_ID))
 
 
+BOOK_EXAMPLE = "Example: utcourts book gre-squash tomorrow 9pm --court B"
+
+
 def _split_book_terms(terms: list[str], today: date) -> tuple[list[str], date | None, int | None]:
     facs, day, at = [], None, None
     for t in terms:
@@ -1104,24 +1409,38 @@ def _split_book_terms(terms: list[str], today: date) -> tuple[list[str], date | 
         try:
             m = parse_clock(t)
         except UTCourtsError:
-            raise UTCourtsError(f"Didn't understand {t!r}. Try: utcourts book gre-squash tomorrow 9pm --court B")
+            raise UTCourtsError(f"Didn't understand “{t}”", hint=BOOK_EXAMPLE)
         if at is not None:
             raise UTCourtsError("Give just one time.")
         at = m
     return facs, day, at
 
 
-def _describe(facility: str, day: str, label: str, court: str) -> str:
-    d = date.fromisoformat(day)
-    return f"{facility}, court {court}, {d:%a %b} {d.day} at {label}"
-
-
 def _find_slot(g: DayResult, t: str, court: str) -> Slot | None:
     return next((s for s in g.slots if s.time == t and s.court.lower() == court.lower()), None)
 
 
-def _print_messages(msgs: list[dict]) -> str:
-    return "".join(f"\n  RecSports said: {m['text']}" for m in msgs)
+def _said(p: Paint, msgs: list[dict], quiet: bool = False) -> list[str]:
+    """What RecSports itself said, one line each."""
+    return [p(f"  RecSports: {m['text']}", "dim") if quiet else f"  {p('RecSports:', 'dim')} {m['text']}"
+            for m in msgs]
+
+
+def _taken_words(slots: list[Slot]) -> str:
+    """'court 11 reserved' / 'courts A B reserved · court C event (Handball)'"""
+    groups: dict[str, list[str]] = {}
+    for s in slots:
+        if s.status == "event":
+            word = "event (" + re.sub(r"^Event Conflict:\s*", "", s.detail) + ")"
+        elif s.status == "priority":
+            word = "faculty/staff priority"
+        elif s.status == "unavailable":
+            word = s.detail.lower() or "unavailable"
+        else:
+            word = s.status
+        groups.setdefault(word, []).append(s.court)
+    return " · ".join(f"court{'s' if len(cs) > 1 else ''} {' '.join(sorted(cs, key=court_key))} {word}"
+                      for word, cs in groups.items())
 
 
 def make_book_action(day: date, facility_id: int, t: str, court: str):
@@ -1159,104 +1478,177 @@ def cmd_book(args) -> int:
     if args.at:
         at = parse_clock(args.at)
     if not fac_terms:
-        raise UTCourtsError("Say which sport or facility, e.g. `utcourts book gre-squash tomorrow 9pm`.")
+        raise UTCourtsError("Say which sport or facility.", hint=BOOK_EXAMPLE)
     if at is None:
-        raise UTCourtsError("Say what time, e.g. `9pm` or `21:00`.")
+        raise UTCourtsError("Say what time.", hint="For example 9pm, 9:30pm or 21:00.")
     day = day or today
     if day < today or day > today + timedelta(days=MAX_DAYS_AHEAD):
-        raise UTCourtsError(f"RecSports only books today through {today + timedelta(days=MAX_DAYS_AHEAD):%a %b %d}.")
+        raise UTCourtsError(f"RecSports only books today through {fmt_day(today + timedelta(days=MAX_DAYS_AHEAD))}.")
     facilities = resolve_facilities(fac_terms)
     interactive = sys.stdin.isatty()
     allow_login = args.login and interactive
     want = hhmm(at)
+    p = Paint(sys.stdout)
+    when = f"{fmt_time(at)} on {fmt_day(day)}"
 
-    grids = get_results([(day, f.id) for f in facilities], allow_login)
+    with Spinner(_checking(facilities), enabled=not args.json):
+        grids = get_results([(day, f.id) for f in facilities], allow_login)
     court_ok = (lambda s: s.court.lower() == args.court.lower()) if args.court else (lambda s: True)
-    cands = [(g, s) for g in grids for s in g.slots if s.time == want and s.status == "open" and court_ok(s)]
+    cands = [(g, s) for g in grids for s in sorted(g.slots, key=lambda s: court_key(s.court))
+             if s.time == want and s.status == "open" and court_ok(s)]
     base = {"date": day.isoformat(), "time": want}
 
     if not cands:
-        lines, near_all = [], []
+        lines, near_all = [p.bad(f"Court {args.court} isn't open at {when}" if args.court
+                                 else f"Nothing open at {when}")], []
+        lw = len("closest open")
+        at_label = f"at {fmt_time(at)}".ljust(lw)
+        has_court = [g for g in grids if args.court and any(c.lower() == args.court.lower() for c in g.courts)]
         for g in grids:
             here = [s for s in g.slots if s.time == want and court_ok(s)]
             what = ", ".join(f"{s.court}: {s.detail or s.status}" for s in here) or "no slot at that time"
-            opens = sorted(g.open_by_time(), key=lambda x: abs(int(x["time"][:2]) * 60 + int(x["time"][3:]) - at))[:3]
-            near = "; ".join(f"{x['label']} ({', '.join(x['courts'])})" for x in sorted(opens, key=lambda x: x["time"]))
+            opens = sorted(g.open_by_time(), key=lambda x: abs(_mins(x["time"]) - at))[:3]
             near_all.append({"facility": g.facility, "at_that_time": what, "closest_open": opens})
-            lines.append(f"  {g.facility}: {what}" + (f"\n    closest open: {near}" if near else ""))
-        _emit(args, {**base, "status": "not_open", "facilities": near_all},
-              f"Nothing open at {want} on {day:%a %b} {day.day}.\n" + "\n".join(lines))
+            if has_court and g not in has_court:
+                continue  # no court by that name here; just noise
+            lines += ["", "  " + fac_title(p, g.facility_id, g.facility),
+                      f"    {p(at_label, 'dim')}  "
+                      + (_taken_words(here) if here else p(
+                          f"no court {args.court} here" if args.court and g not in has_court
+                          else "no slot at that time", "dim"))]
+            opens = sorted(opens, key=lambda x: x["time"])
+            tw = max((len(fmt_time(_mins(x["time"]))) for x in opens), default=0)
+            for i, x in enumerate(opens):
+                lines.append(f"    {p(('closest open' if i == 0 else '').ljust(lw), 'dim')}  "
+                             f"{fmt_time(_mins(x['time'])):>{tw}}  {_courts_line(p, x['courts'])}")
+            if not opens:
+                lines.append(f"    {p('nothing else open this day', 'dim')}")
+        _emit(args, {**base, "status": "not_open", "facilities": near_all}, "\n".join(lines))
         return NOTHING_DONE
 
     if len(cands) > 1:
         options = [{"facility": g.facility, "facility_id": g.facility_id, "court": s.court, "label": s.label}
                    for g, s in cands]
+        cw = max(len(s.court) for _, s in cands)
+        by_fac = [list(grp) for _, grp in groupby(cands, key=lambda gs: gs[0].facility_id)]
         if interactive and not args.json and not args.yes and not args.dry_run:
-            for i, (g, s) in enumerate(cands, 1):
-                print(f"  {i}. {_describe(g.facility, g.date, s.label, s.court)}")
+            nw = len(str(len(cands)))
+            lines, i = [p(f"{len(cands)} courts are open at {when}", "bold")], 0
+            for grp in by_fac:
+                lines += ["", "  " + fac_title(p, grp[0][0].facility_id, grp[0][0].facility)]
+                for _, s in grp:
+                    i += 1
+                    lines.append(f"    {p(str(i).rjust(nw), 'dim')}  court {s.court}")
+            print("\n".join(lines) + "\n")
             pick = _ask(f"Which one? [1-{len(cands)}, Enter to stop] ")
             if not pick.isdigit() or not 1 <= int(pick) <= len(cands):
-                print("Not booked.")
+                print(p("Nothing booked.", "dim"))
                 return NOTHING_DONE
             cands = [cands[int(pick) - 1]]
         else:
-            _emit(args, {**base, "status": "ambiguous", "options": options},
-                  "More than one court is open then — add --court and/or a facility short name:\n"
-                  + "\n".join(f"  {_describe(g.facility, g.date, s.label, s.court)}" for g, s in cands))
+            lines = [p.warn(f"{len(cands)} courts are open at {when}. Pick one:")]
+            for grp in by_fac:
+                lines += ["", "  " + fac_title(p, grp[0][0].facility_id, grp[0][0].facility)]
+                for g, s in grp:
+                    cmd = (f"utcourts book {fac_alias(g.facility_id) or g.facility_id} {day_token(day)} "
+                           f"{time_token(want)} --court {s.court}")
+                    lines.append(f"    court {s.court:<{cw}}  {p(cmd, 'dim')}")
+            _emit(args, {**base, "status": "ambiguous", "options": options}, "\n".join(lines))
             return NOTHING_DONE
 
     g, s = cands[0]
-    what = _describe(g.facility, g.date, s.label, s.court)
+    what = slot_desc(g.facility_id, g.facility, g.date, s.time, s.court)
     slot = {**base, "facility": g.facility, "facility_id": g.facility_id, "court": s.court, "label": s.label}
     if args.dry_run:
-        _emit(args, {**slot, "status": "dry_run"}, f"Would book: {what}. (Dry run — nothing booked.)")
+        _emit(args, {**slot, "status": "dry_run"}, p.note(f"Would book {what}") + p("  (dry run)", "dim"))
         return 0
     if not args.yes:
         if not interactive:
             _emit(args, {**slot, "status": "not_confirmed"},
-                  f"Not booked: {what}. Add --yes to book without a prompt "
-                  "(only once the person has said yes).")
+                  p.warn(f"Not booked: {what}") + "\n  There's no terminal to confirm in. Add --yes to book it.")
             return NOTHING_DONE
         if _ask(f"Book {what}? [y/N] ").lower() not in ("y", "yes"):
-            print("Not booked.")
+            print(p("Nothing booked.", "dim"))
             return NOTHING_DONE
 
-    out = with_client(make_book_action(day, g.facility_id, s.time, s.court), allow_login)
-    payload = {**slot, **out}
-    msgs = _print_messages(out.get("messages", []))
-    text = {
-        "booked": f"Booked: {what}.{msgs}\n  (Double-checked: it no longer shows as open. Cancel with `utcourts mine` / `utcourts cancel`.)",
-        "failed": f"Not booked: {what}.{msgs or chr(10) + '  The court still shows as open.'}",
-        "unclear": f"Not sure it worked: {what}.{msgs}\n  {out.get('note') or 'Check `utcourts mine`.'}",
-        "taken": f"Not booked — someone got there first: {what}. {out.get('note', '')}",
+    with Spinner("Booking…", enabled=not args.json):
+        out = with_client(make_book_action(day, g.facility_id, s.time, s.court), allow_login)
+    msgs = out.get("messages", [])
+    lines = {
+        "booked": [p.ok(f"Booked {what}"), *_said(p, msgs, quiet=True),
+                   p("  Confirmed on the grid. To cancel: utcourts cancel", "dim")],
+        "failed": [p.bad(f"Not booked: {what}"), *(_said(p, msgs) or ["  The court still shows as open."])],
+        "unclear": [p.warn(f"Not sure it went through: {what}"), *_said(p, msgs), "  Check with: utcourts mine"],
+        "taken": [p.bad(f"Someone else just took it: {what}")],
     }[out["status"]]
-    _emit(args, payload, text)
+    _emit(args, {**slot, **out}, "\n".join(lines))
     return 0 if out["status"] == "booked" else NOTHING_DONE
 
 
+_WEEKDAY_WORD = re.compile(r"\b(Mon(day)?|Tue(s|sday)?|Wed(nesday)?|Thu(r|rs|rsday)?|Fri(day)?|Sat(urday)?|"
+                           r"Sun(day)?)\b\.?,?", re.I)
+
+
+def reservation_parts(text: str) -> tuple[str, str, str] | None:
+    """'WC - PB - 11 11/18/2026 8:00 PM' -> ('Wed Nov 18', '8 PM', 'WC - PB - 11'); None if no date + time."""
+    md = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b", text)
+    mt = re.search(r"\b(\d{1,2}):(\d{2})\s*([AaPp])\.?\s*[Mm]\b\.?", text)
+    if not md or not mt:
+        return None
+    try:
+        year = int(md[3]) + (2000 if len(md[3]) == 2 else 0)
+        d = date(year, int(md[1]), int(md[2]))
+    except ValueError:
+        return None
+    mins = (int(mt[1]) % 12 + (12 if mt[3].lower() == "p" else 0)) * 60 + int(mt[2])
+    rest = text
+    for a, b in sorted([md.span(), mt.span()], reverse=True):
+        rest = rest[:a] + " " + rest[b:]
+    rest = re.sub(r"\s+", " ", _WEEKDAY_WORD.sub(" ", rest)).strip(" -,|·")
+    return fmt_day(d), fmt_time(mins), rest
+
+
+def reservation_desc(text: str) -> str:
+    parts = reservation_parts(text)
+    return f"{parts[2]} · {parts[0]} · {parts[1]}" if parts and parts[2] else text
+
+
+def _reservation_lines(p: Paint, items: list[Reservation]) -> list[str]:
+    rows = [(r, reservation_parts(r.text)) for r in items]
+    dw = max((len(x[0]) for _, x in rows if x), default=0)
+    tw = max((len(x[1]) for _, x in rows if x), default=0)
+    nw = len(str(len(items)))
+    lines = []
+    for r, x in rows:
+        body = f"{x[0]:<{dw}}  {x[1]:>{tw}}  {x[2]}" if x else r.text
+        lines.append(f"  {p(str(r.index).rjust(nw), 'dim')}  {body}"
+                     + ("" if r.cancel_method else p("  (cancel on the website)", "dim")))
+    return lines
+
+
 def cmd_mine(args) -> int:
-    items, notices, _ = with_client(fetch_reservations, args.login and sys.stdin.isatty())
+    with Spinner("Loading your reservations…", enabled=not args.json):
+        items, notices, _ = with_client(fetch_reservations, args.login and sys.stdin.isatty())
     payload = {"source": MINE_URL, "notices": notices,
                "reservations": [{"index": r.index, "text": r.text, "can_cancel": r.cancel_method is not None}
                                 for r in items]}
+    p = Paint(sys.stdout)
     if items:
-        lines = ["Your reservations:"]
-        for r in items:
-            lines.append(f"  {r.index}. {r.text}" + ("" if r.cancel_method else "   (cancel this one on the website)"))
-        lines.append("\nCancel one with: utcourts cancel <number>")
-        text = "\n".join(lines)
+        lines = [p("Your reservations", "bold"), "", *_reservation_lines(p, items)]
+        if any(r.cancel_method for r in items):
+            lines += ["", p("To cancel one: utcourts cancel <number>", "dim")]
     else:
-        text = "No reservations with a cancel option on My Reservations."
+        lines = ["No reservations."]
     if notices:
-        text += "\n" + "\n".join(f"  {n}" for n in notices)
-    _emit(args, payload, text)
+        lines += [""] + [p(n, "dim") for n in notices]
+    _emit(args, payload, "\n".join(lines))
     return 0
 
 
 def _pick_reservation(items: list[Reservation], which: str | None, match: str | None) -> Reservation | None:
     if which:
         if not which.isdigit() or not 1 <= int(which) <= len(items):
-            raise UTCourtsError(f"There's no reservation #{which}. Run `utcourts mine` to see the numbers.")
+            raise UTCourtsError(f"There's no reservation #{which}.", hint="See the numbers: utcourts mine")
         return items[int(which) - 1]
     if match:
         words = match.lower().split()
@@ -1264,8 +1656,8 @@ def _pick_reservation(items: list[Reservation], which: str | None, match: str | 
         if len(hits) == 1:
             return hits[0]
         if not hits:
-            raise UTCourtsError(f"No reservation matches {match!r}. Run `utcourts mine`.")
-        raise UTCourtsError(f"{len(hits)} reservations match {match!r}; be more specific or use the number.")
+            raise UTCourtsError(f"No reservation matches “{match}”.", hint="See them all: utcourts mine")
+        raise UTCourtsError(f"{len(hits)} reservations match “{match}”.", hint="Be more specific, or use the number.")
     return None
 
 
@@ -1291,182 +1683,228 @@ def make_cancel_action(text: str):
 def cmd_cancel(args) -> int:
     interactive = sys.stdin.isatty()
     allow_login = args.login and interactive
-    items, notices, _ = with_client(fetch_reservations, allow_login)
+    p = Paint(sys.stdout)
+    with Spinner("Loading your reservations…", enabled=not args.json):
+        items, notices, _ = with_client(fetch_reservations, allow_login)
     if not items:
-        _emit(args, {"status": "not_found", "notices": notices}, "You have no reservations to cancel.")
+        _emit(args, {"status": "not_found", "notices": notices}, "No reservations to cancel.")
         return NOTHING_DONE
     target = _pick_reservation(items, args.which, args.match)
     if target is None:
-        listing = "\n".join(f"  {r.index}. {r.text}" for r in items)
         if interactive and not args.json and not args.yes:
-            print(listing)
+            print("\n".join([p("Your reservations", "bold"), "", *_reservation_lines(p, items), ""]))
             pick = _ask(f"Which one? [1-{len(items)}, Enter to stop] ")
             if not pick:
-                print("Nothing cancelled.")
+                print(p("Nothing cancelled.", "dim"))
                 return NOTHING_DONE
             target = _pick_reservation(items, pick, None)
         else:
             _emit(args, {"status": "ambiguous", "reservations": [{"index": r.index, "text": r.text} for r in items]},
-                  "Say which one: utcourts cancel <number>\n" + listing)
+                  "\n".join([p.warn("Which one? Run utcourts cancel <number>"), "", *_reservation_lines(p, items)]))
             return NOTHING_DONE
     base = {"reservation": target.text, "index": target.index}
+    what = reservation_desc(target.text)
     if target.cancel_method is None:
         _emit(args, {**base, "status": "unsupported"},
-              f"Can't cancel this one from here (its button runs page JavaScript). Cancel it at {MINE_URL}")
+              p.bad(f"Can't cancel this one from here: {what}")
+              + f"\n  Its cancel button only works on the website: {MINE_URL}")
         return NOTHING_DONE
     if args.dry_run:
-        _emit(args, {**base, "status": "dry_run"}, f"Would cancel: {target.text}. (Dry run — nothing cancelled.)")
+        _emit(args, {**base, "status": "dry_run"}, p.note(f"Would cancel {what}") + p("  (dry run)", "dim"))
         return 0
     if not args.yes:
         if not interactive:
             _emit(args, {**base, "status": "not_confirmed"},
-                  f"Not cancelled: {target.text}. Add --yes to cancel without a prompt "
-                  "(only once the person has said yes).")
+                  p.warn(f"Not cancelled: {what}") + "\n  There's no terminal to confirm in. Add --yes to cancel it.")
             return NOTHING_DONE
-        if _ask(f"Cancel {target.text}? [y/N] ").lower() not in ("y", "yes"):
-            print("Nothing cancelled.")
+        if _ask(f"Cancel {what}? [y/N] ").lower() not in ("y", "yes"):
+            print(p("Nothing cancelled.", "dim"))
             return NOTHING_DONE
-    out = with_client(make_cancel_action(target.text), allow_login)
-    msgs = _print_messages(out.get("messages", []))
-    text = {
-        "cancelled": f"Cancelled: {target.text}.{msgs}\n  (Double-checked: it's gone from My Reservations.)",
-        "failed": f"Not cancelled: {target.text}.{msgs or chr(10) + '  It still shows on My Reservations.'}",
-        "unclear": f"Not sure it worked: {target.text}.{msgs}\n  Check `utcourts mine`.",
-        "not_found": f"That reservation isn't on My Reservations anymore: {target.text}.",
+    with Spinner("Cancelling…", enabled=not args.json):
+        out = with_client(make_cancel_action(target.text), allow_login)
+    msgs = out.get("messages", [])
+    lines = {
+        "cancelled": [p.ok(f"Cancelled {what}"), *_said(p, msgs, quiet=True),
+                      p("  Confirmed: it's gone from My Reservations.", "dim")],
+        "failed": [p.bad(f"Not cancelled: {what}"), *(_said(p, msgs) or ["  It still shows on My Reservations."])],
+        "unclear": [p.warn(f"Not sure it went through: {what}"), *_said(p, msgs), "  Check with: utcourts mine"],
+        "not_found": [p.bad(f"It's no longer on My Reservations: {what}")],
     }[out["status"]]
-    _emit(args, {**base, **out}, text)
+    _emit(args, {**base, **out}, "\n".join(lines))
     return 0 if out["status"] == "cancelled" else NOTHING_DONE
 
 
 # --------------------------------------------------------------------------- #
 # Command line
 # --------------------------------------------------------------------------- #
-TOP_HELP = """\
-Check, book and cancel UT RecSports courts from the terminal.
-
-Sign in once with `utcourts login`; after that it re-signs itself in quietly
-until UT's single sign-on wants your EID + Duo again.
-"""
-
-TOP_EPILOG = """\
-examples:
-  utcourts squash tomorrow --after 6pm      (check is the default command)
-  utcourts check rb fri --grid
-  utcourts book gre-squash tomorrow 9pm --court B
-  utcourts mine
-  utcourts cancel 1
-
-  utcourts help <command>                   more on one command
-
-sports:  squash (sq) · racquetball (rb, handball) · pickleball (pb) · tennis
-dates:   today · tomorrow · fri · +2 · 11/20 · 2026-11-20   (today through 7 days out)
-times:   9pm · 21 · 21:00
-
-exit codes: 0 ok · 1 bad input · 2 needs a fresh sign-in · 3 network trouble or page changed
-            4 nothing done (not open, not confirmed, ambiguous, or RecSports said no)
-"""
-
 COMMANDS = ("check", "book", "reserve", "mine", "reservations", "cancel", "login", "status",
             "logout", "facilities", "help")
 
 
-def build_parser() -> tuple[argparse.ArgumentParser, dict]:
-    fmt = argparse.RawDescriptionHelpFormatter
+def print_top_help() -> None:
+    p = Paint(sys.stdout)
+    h = lambda s: p(s, "bold")  # noqa: E731
+    commands = [("check", "open courts (the default)"),
+                ("book", "book a court, after you confirm"),
+                ("mine", "your reservations"),
+                ("cancel", "cancel a reservation, after you confirm"),
+                ("login", "sign in with your UT EID + Duo"),
+                ("status", "is the saved sign-in still good?"),
+                ("facilities", "facility short names"),
+                ("logout", "forget the saved sign-in")]
+    print("\n".join([
+        f"{h('utcourts')} {p(__version__, 'dim')}  UT RecSports courts from the terminal",
+        "",
+        h("Usage"),
+        "  utcourts [check] [sport|facility] [day] [--after 6pm] [--before 9pm]",
+        "  utcourts <command> [options]",
+        "",
+        h("Commands"),
+        *[f"  {name:<12}{what}" for name, what in commands],
+        "",
+        h("Examples"),
+        "  utcourts squash tomorrow --after 6pm",
+        "  utcourts check rb fri --grid",
+        "  utcourts book gre-squash tomorrow 9pm --court B",
+        "  utcourts cancel 1",
+        "",
+        h("Words"),
+        "  sports  squash · racquetball (rb) · handball · pickleball (pb) · tennis",
+        "  days    today · tomorrow · fri · +2 · 11/20   " + p(f"up to {MAX_DAYS_AHEAD} days ahead", "dim"),
+        "  times   9pm · 9:30pm · 21:00",
+        "",
+        p("More on one command: utcourts help <command>", "dim"),
+    ]))
 
-    def wrap(text: str) -> str:
-        return textwrap.fill(text, 78)
-    p = argparse.ArgumentParser(prog="utcourts", description=TOP_HELP, epilog=TOP_EPILOG, formatter_class=fmt)
-    p.add_argument("-V", "--version", action="version", version=f"utcourts {__version__}")
-    sub = p.add_subparsers(dest="cmd", title="commands", metavar="<command>")
+
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    def __init__(self, prog: str):
+        super().__init__(prog, max_help_position=24, width=min(shutil.get_terminal_size((88, 24)).columns, 88))
+
+    def add_usage(self, usage, actions, groups, prefix=None):
+        return super().add_usage(usage, actions, groups, prefix=Paint(sys.stdout)("Usage:", "bold") + " ")
+
+    def start_section(self, heading):
+        return super().start_section(Paint(sys.stdout)(heading, "bold") if heading else heading)
+
+
+class _Parser(argparse.ArgumentParser):
+    def __init__(self, *a, **kw):
+        if sys.version_info >= (3, 14):
+            kw.setdefault("color", False)  # we do our own
+        kw.setdefault("add_help", False)
+        kw.setdefault("formatter_class", _HelpFormatter)
+        super().__init__(*a, **kw)
+        self._optionals.title = "Options"
+        self.add_argument("-h", "--help", action="help", help=argparse.SUPPRESS)
+
+    def error(self, message: str):
+        e = Paint(sys.stderr)
+        words = self.prog.split()
+        cmd = words[1] if len(words) > 1 else getattr(self, "command", None)
+        log(e.bad(message[:1].upper() + message[1:]))
+        log(f"  See: utcourts help{' ' + cmd if cmd else ''}")
+        raise SystemExit(1)
+
+
+def _examples(*rows: tuple[str, str]) -> str:
+    p = Paint(sys.stdout)
+    w = max(len(cmd) for cmd, _ in rows)
+    return p("Examples:", "bold") + "\n" + "\n".join(
+        f"  {cmd:<{w}}  {p(note, 'dim')}".rstrip() for cmd, note in rows)
+
+
+def build_parser() -> tuple[argparse.ArgumentParser, dict]:
+    p = _Parser(prog="utcourts")
+    sub = p.add_subparsers(dest="cmd")
     subs: dict[str, argparse.ArgumentParser] = {}
 
-    def no_login(sp):
+    def common(sp, json_help: bool = True):
+        sp.add_argument("--json", action="store_true", help="JSON output" if json_help else argparse.SUPPRESS)
         sp.add_argument("--no-login", dest="login", action="store_false",
-                        help="never open a sign-in window; exit 2 instead (automatic when not in a terminal)")
+                        help="never open a sign-in window" if json_help else argparse.SUPPRESS)
 
-    c = sub.add_parser("check", help="show open courts (the default command)", formatter_class=fmt,
-                       description=wrap("Show open courts. Words can be a sport, a facility short name, or a "
-                                   "date, in any order."),
-                       epilog="examples:\n  utcourts check squash tomorrow --after 6pm\n"
-                              "  utcourts check rb gre-squash fri --before 9pm\n"
-                              "  utcourts check tennis --days 3 --json\n"
-                              "  utcourts check gre-rb +2 --grid")
-    c.add_argument("terms", nargs="*", help="sport / facility / date words")
-    c.add_argument("-s", "--sport", action="append", help="sport or facility (repeatable)")
-    c.add_argument("-d", "--date", help="date (default: today)")
-    c.add_argument("--days", type=int, default=1, help="look at this many days starting from the date")
-    c.add_argument("--after", help="only slots starting at/after this time (e.g. 17, 5pm)")
-    c.add_argument("--before", help="only slots starting before this time (e.g. 21, 9pm)")
-    c.add_argument("--grid", action="store_true", help="show the full grid, not just open courts")
-    c.add_argument("--all", action="store_true", help="--grid, and in --json include every slot")
-    c.add_argument("--json", action="store_true", help="machine-readable output")
-    no_login(c)
+    c = sub.add_parser("check", usage="utcourts [check] [sport|facility …] [day] [options]",
+                       description="Show open courts. Sports, facility short names and the day can go in any order.",
+                       epilog=_examples(("utcourts squash tomorrow --after 6pm", ""),
+                                        ("utcourts check rb gre-squash fri --before 9pm", ""),
+                                        ("utcourts check tennis --days 3", ""),
+                                        ("utcourts check gre-rb +2 --grid", "everything, not just what's open")))
+    c.add_argument("terms", nargs="*", help=argparse.SUPPRESS)
+    c.add_argument("-s", "--sport", action="append", help=argparse.SUPPRESS)
+    c.add_argument("-d", "--date", help=argparse.SUPPRESS)
+    c.add_argument("--after", metavar="TIME", help="only times from TIME on (5pm, 17:30)")
+    c.add_argument("--before", metavar="TIME", help="only times before TIME")
+    c.add_argument("--days", type=int, default=1, metavar="N", help="N days, starting from the day")
+    c.add_argument("--grid", action="store_true", help="the whole grid, not just open courts")
+    c.add_argument("--all", action="store_true", help="--grid; with --json, every slot")
+    common(c)
     c.set_defaults(func=cmd_check)
     subs["check"] = c
 
-    b = sub.add_parser("book", aliases=["reserve"], help="book one open court (asks before booking)",
-                       formatter_class=fmt,
-                       description=wrap("Book one open court. You give the facility (or sport), the day and the "
-                                   "start time; if more than one court fits, it asks (or add --court). "
-                                   "It always shows exactly what it's about to book and asks y/N first, "
-                                   "then re-checks the grid to make sure it worked."),
-                       epilog="examples:\n  utcourts book gre-squash tomorrow 9pm --court B\n"
-                              "  utcourts book squash fri 6pm              (pick from a list)\n"
-                              "  utcourts book rsc-rb +2 18:00 --dry-run    (show it, don't book)\n\n"
-                              "scripts/agents: no prompts without a terminal, so pass --yes — only after\n"
-                              "the person has confirmed that exact slot.")
-    b.add_argument("terms", nargs="*", help="facility/sport, date and time words, in any order")
-    b.add_argument("--court", help="court name as shown on the grid (1, A, B1A, ...)")
-    b.add_argument("--at", help="start time (instead of a time word)")
-    b.add_argument("-d", "--date", help="date (instead of a date word)")
-    b.add_argument("-y", "--yes", action="store_true", help="don't ask; book it")
+    b = sub.add_parser("book", aliases=["reserve"],
+                       usage="utcourts book <sport|facility> <day> <time> [--court NAME] [options]",
+                       description="Book one open court. It shows exactly what it will book and asks first,\n"
+                                   "then re-checks the grid to make sure it worked.",
+                       epilog=_examples(("utcourts book gre-squash tomorrow 9pm --court B", ""),
+                                        ("utcourts book squash fri 6pm", "pick from a list"),
+                                        ("utcourts book rsc-rb +2 18:00 -n", "preview only")))
+    b.add_argument("terms", nargs="*", help=argparse.SUPPRESS)
+    b.add_argument("--court", metavar="NAME", help="court as named on the grid (1, A, B1A…)")
+    b.add_argument("--at", help=argparse.SUPPRESS)
+    b.add_argument("-d", "--date", help=argparse.SUPPRESS)
     b.add_argument("-n", "--dry-run", action="store_true", help="show what would be booked, then stop")
-    b.add_argument("--json", action="store_true", help="machine-readable output")
-    no_login(b)
+    b.add_argument("-y", "--yes", action="store_true", help="book without asking")
+    common(b)
     b.set_defaults(func=cmd_book)
     subs["book"] = subs["reserve"] = b
 
-    m = sub.add_parser("mine", aliases=["reservations"], help="list your reservations", formatter_class=fmt,
-                       description=wrap("List your reservations from the My Reservations page, numbered for `cancel`."))
-    m.add_argument("--json", action="store_true", help="machine-readable output")
-    no_login(m)
+    m = sub.add_parser("mine", aliases=["reservations"], usage="utcourts mine [options]",
+                       description="Your reservations from My RecSports, numbered for `utcourts cancel`.")
+    common(m)
     m.set_defaults(func=cmd_mine)
     subs["mine"] = subs["reservations"] = m
 
-    x = sub.add_parser("cancel", help="cancel one of your reservations (asks first)", formatter_class=fmt,
-                       description=wrap("Cancel a reservation. Pick it by its number from `utcourts mine`, or by "
-                                   "words that appear in it. It asks y/N first, then checks it's gone."),
-                       epilog="examples:\n  utcourts cancel 1\n  utcourts cancel --match \"11/18 9:00 PM\"\n"
-                              "  utcourts cancel            (pick from a list)")
-    x.add_argument("which", nargs="?", help="reservation number from `utcourts mine`")
-    x.add_argument("--match", help="words that appear in the reservation (e.g. a date and time)")
-    x.add_argument("-y", "--yes", action="store_true", help="don't ask; cancel it")
+    x = sub.add_parser("cancel", usage="utcourts cancel [number] [--match WORDS] [options]",
+                       description="Cancel a reservation, picked by its number from `utcourts mine` or by words\n"
+                                   "in it. It asks first, then checks that it's gone.",
+                       epilog=_examples(("utcourts cancel 1", ""),
+                                        ('utcourts cancel --match "11/18 9:00 PM"', ""),
+                                        ("utcourts cancel", "pick from a list")))
+    x.add_argument("which", nargs="?", help=argparse.SUPPRESS)
+    x.add_argument("--match", metavar="WORDS", help="pick the reservation that contains these words")
     x.add_argument("-n", "--dry-run", action="store_true", help="show what would be cancelled, then stop")
-    x.add_argument("--json", action="store_true", help="machine-readable output")
-    no_login(x)
+    x.add_argument("-y", "--yes", action="store_true", help="cancel without asking")
+    common(x)
     x.set_defaults(func=cmd_cancel)
     subs["cancel"] = x
 
-    lg = sub.add_parser("login", help="sign in (opens a browser window for your EID + Duo)")
+    lg = sub.add_parser("login", usage="utcourts login",
+                        description="Sign in with your UT EID + Duo in a separate Chrome window. After that,\n"
+                                    "utcourts signs itself back in quietly until UT asks for Duo again.")
     lg.set_defaults(func=cmd_login)
     subs["login"] = lg
 
-    st = sub.add_parser("status", help="is the saved session still good? (also works as a keep-alive)")
-    st.add_argument("--refresh", action="store_true", help="if expired, try a quiet SSO sign-in")
-    st.add_argument("-q", "--quiet", action="store_true")
+    st = sub.add_parser("status", usage="utcourts status [--refresh] [-q]",
+                        description="Check whether the saved sign-in still works.")
+    st.add_argument("--refresh", action="store_true", help="if it expired, try a quiet sign-in")
+    st.add_argument("-q", "--quiet", action="store_true", help="print nothing when signed in")
+    common(st, json_help=False)
     st.set_defaults(func=cmd_status)
     subs["status"] = st
 
-    fa = sub.add_parser("facilities", help="list facilities and their short names")
-    fa.add_argument("--json", action="store_true")
+    fa = sub.add_parser("facilities", usage="utcourts facilities",
+                        description="Facilities, the sports they have, and their short names.")
+    common(fa, json_help=False)
     fa.set_defaults(func=cmd_facilities)
     subs["facilities"] = fa
 
-    lo = sub.add_parser("logout", help="delete the saved session and browser profile")
+    lo = sub.add_parser("logout", usage="utcourts logout",
+                        description="Delete the saved session and the private browser profile.")
     lo.set_defaults(func=cmd_logout)
     subs["logout"] = lo
 
-    h = sub.add_parser("help", help="show help for a command")
+    h = sub.add_parser("help", usage="utcourts help [command]")
     h.add_argument("topic", nargs="?")
     h.set_defaults(func=None)
     subs["help"] = h
@@ -1474,20 +1912,35 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser, subs = build_parser()
-    argv = sys.argv[1:] if argv is None else argv
-    if not argv or (argv[0] not in COMMANDS and argv[0] not in ("-h", "--help", "-V", "--version")):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] in ("-h", "--help"):
+        print_top_help()
+        return 0
+    if argv and argv[0] in ("-V", "--version"):
+        print(f"utcourts {__version__}")
+        return 0
+    if not argv or argv[0] not in COMMANDS:
         argv = ["check", *argv]  # `utcourts squash tomorrow` == `utcourts check squash tomorrow`
-    args = parser.parse_args(argv)
+    parser, subs = build_parser()
+    parser.command = argv[0]  # so a stray option is reported against its command
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:  # --help, or a usage error (already printed)
+        return e.code if isinstance(e.code, int) else 0
     if args.cmd == "help":
-        (subs.get(args.topic) or parser).print_help()
+        sp = subs.get(args.topic or "")
+        sp.print_help() if sp else print_top_help()
         return 0
     try:
         return args.func(args)
     except UTCourtsError as e:
-        log(f"utcourts: {e}")
+        p = Paint(sys.stderr)
+        log(p.bad(str(e)))
+        for line in (e.hint or "").splitlines():
+            log(f"  {line}")
         return e.exit_code
     except KeyboardInterrupt:
+        log("")
         return 130
 
 

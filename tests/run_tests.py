@@ -19,7 +19,7 @@ app_port, sso_port = mock_site.start()
 tmp_home = tempfile.mkdtemp(prefix="utcourts-test-")
 os.environ["UTCOURTS_BASE_URL"] = f"http://127.0.0.1:{app_port}"
 os.environ["UTCOURTS_HOME"] = tmp_home
-os.environ["UTCOURTS_BROWSER"] = "chromium"
+os.environ.setdefault("UTCOURTS_BROWSER", "chromium")  # UTCOURTS_BROWSER=chrome to use installed Chrome
 os.environ["NO_COLOR"] = "1"
 sys.path.insert(0, str(HERE.parent / "plugins/ut-recsports/skills/courts/scripts"))
 import utcourts as U  # noqa: E402
@@ -103,6 +103,19 @@ ok([f.id for f in U.resolve_facilities(["squash"])] == [28, 40, 55], "squash -> 
 ok([f.id for f in U.resolve_facilities(["tennis"])] == [60, 65], "tennis -> 2 facilities")
 ok([f.id for f in U.resolve_facilities(["rb", "gre-squash"])] == [35, 50, 40], "mix sport + facility")
 
+print("human formatting")
+ok((U.fmt_time(1260), U.fmt_time(1290), U.fmt_time(720), U.fmt_time(0)) == ("9 PM", "9:30 PM", "12 PM", "12 AM"),
+   "times read like 9 PM / 9:30 PM")
+ok(sorted(["10", "B2A", "9", "B1A", "A"], key=U.court_key) == ["9", "10", "A", "B1A", "B2A"], "courts sort naturally")
+ok(U.reservation_parts("WC - PB - 11 11/18/2026 8:00 PM") == ("Wed Nov 18", "8 PM", "WC - PB - 11"),
+   "real My Reservations text -> day, time, court")
+ok(U.reservation_parts("GRE - Squash Court A Wed 11/18/2026 6:00 PM") == ("Wed Nov 18", "6 PM", "GRE - Squash Court A"),
+   "weekday word is dropped, not duplicated")
+ok(U.reservation_parts("something without a date") is None, "unrecognized text is left as is")
+code, out, err = run("check", "--bogus")
+ok(code == 1 and out == "" and "Unrecognized arguments: --bogus" in err and "utcourts help check" in err,
+   "usage error -> exit 1 (not 2, which means sign-in), with a pointer to help")
+
 print("cli: not signed in")
 code, out, err = run("check", "squash")
 ok(code == 2 and "utcourts login" in err, "no session -> exit 2 + tells you to log in")
@@ -148,8 +161,11 @@ code, out, err = run("squash", "tomorrow", "--after", "5pm")
 dt = time.time() - t0
 ok(code == 0 and err == "", "fast check, nothing on stderr")
 ok(not any("SSO" in line for line in mock_site.REQUEST_LOG), "no SSO traffic")
-ok("Gregory Gym (GRE) - Squash" in out and "6:00 PM" in out and "A, B" in out, "human output lists open courts")
-ok("12:00 PM" not in out, "--after 5pm hides the noon slot")
+ok("GRE Squash" in out and "  6 PM  A  B" in out, "human output lists open courts")
+ok("12 PM" not in out, "--after 5pm hides the noon slot")
+ok("Squash · Tomorrow" in out and "from 5 PM" in out, "title says sport, day and window")
+ok("Book one: utcourts book " in out, "ends with a ready-to-run book command")
+ok("\033[" not in out, "no color codes when not a terminal")
 ok(all("Headless" not in line for line in mock_site.REQUEST_LOG), "fast path sends the saved UA")
 print(f"     (took {dt:.2f}s)\n" + "\n".join("     | " + l for l in out.strip().splitlines()))
 
@@ -165,6 +181,10 @@ ok(code == 0 and len(json.loads(out)["results"]) == 4, "re-signed in quietly, 2 
 mock_site.REQUEST_LOG.clear()
 code, out, err = run("status")
 ok(code == 0 and "Signed in" in out and not any("SSO" in l for l in mock_site.REQUEST_LOG), "status uses fast path")
+code, out, err = run("status", "--json", "--no-login")
+ok(code == 0 and json.loads(out)["signed_in"] is True, "status --json --no-login (what the skill passes)")
+code, out, err = run("facilities", "--no-login")
+ok(code == 0 and "gre-squash" in out, "facilities accepts --no-login too")
 
 print("cli: everything expired -> clear message, exit 2, no hang")
 mock_site.APP_SESSIONS.clear()
@@ -204,14 +224,14 @@ print("book")
 code, out, err = run("book", "gre-squash", "tomorrow", "6pm")
 ok(code == 4 and "--court" in out and "court A" in out and "court B" in out, "two courts open -> lists them, asks for --court")
 code, out, err = run("book", "gre-squash", "tomorrow", "6pm", "--court", "A")
-ok(code == 4 and "Add --yes" in out and not M.BOOK_REQUESTS, "no terminal + no --yes -> nothing sent")
+ok(code == 4 and "--yes" in out and not M.BOOK_REQUESTS, "no terminal + no --yes -> nothing sent")
 code, out, err = run("book", "gre-squash", "tomorrow", "6pm", "--court", "a", "--dry-run", "--json")
 ok(code == 0 and json.loads(out)["status"] == "dry_run" and json.loads(out)["court"] == "A" and not M.BOOK_REQUESTS,
    "--dry-run (court name case-insensitive)")
 code, out, err = run("book", "gre-squash", "tomorrow", "5pm")
-ok(code == 4 and "Nothing open" in out and "closest open" in out and "6:00 PM" in out, "not open -> closest open times")
+ok(code == 4 and "Nothing open at 5 PM" in out and "closest open" in out and "6 PM" in out, "not open -> closest open times")
 code, out, err = run("book", "gre-squash", "tomorrow", "6pm", "--court", "A", "--yes")
-ok(code == 0 and "Booked: Gregory Gym (GRE) - Squash, court A" in out and "confirmed" in out, "books + shows the site's message")
+ok(code == 0 and "Booked GRE Squash · court A" in out and "has been confirmed" in out, "books + shows the site's message")
 ok(len(M.BOOK_REQUESTS) == 1, "exactly one reserve request")
 code, out, err = run("check", "gre-squash", "tomorrow", "--json")
 six = [x for x in json.loads(out)["results"][0]["open"] if x["time"] == "18:00"]
@@ -228,33 +248,35 @@ ok(code == 4 and json.loads(out)["status"] == "failed" and "one reservation per 
 M.REFUSE_BOOKING = None
 n = len(M.BOOK_REQUESTS)
 code, out, err, asked = run_tty(["n"], "book", "gre-squash", "tomorrow", "9pm")
-ok(code == 4 and "Not booked" in out and len(M.BOOK_REQUESTS) == n and "[y/N]" in asked[0], "terminal: answer n -> nothing sent")
+ok(code == 4 and "Nothing booked" in out and len(M.BOOK_REQUESTS) == n and "[y/N]" in asked[0], "terminal: answer n -> nothing sent")
 M.APP_SESSIONS.clear()  # session dies between the check and the booking
 code, out, err, asked = run_tty(["y"], "book", "gre-squash", "tomorrow", "9pm")
 ok(code == 0 and "Booked" in out and "sign back in quietly" in err, "terminal: y -> books, even across a quiet re-login")
 ok(len(M.BOOK_REQUESTS) == n + 1, "...with exactly one reserve request (no double booking)")
 code, out, err, asked = run_tty(["2", "n"], "book", "squash", "tomorrow", "6pm")
-ok(len(asked) == 2 and "Which one?" in asked[0] and "Book Gregory Gym (GRE) - Squash, court B" in asked[1],
+ok(len(asked) == 2 and "Which one?" in asked[0] and "Book GRE Squash · court B" in asked[1],
    "terminal: several facilities -> pick from a numbered list")
 
 print("mine / cancel")
 code, out, err = run("mine")
-ok(code == 0 and "1. GRE - Squash Court A" in out and "2. GRE - Squash Court B" in out and "9:00 PM" in out,
-   "mine lists both bookings, numbered")
+import re  # noqa: E402
+ok(code == 0 and re.search(r"^ +1 +\w{3} \w{3} \d+ +6 PM +GRE - Squash Court A$", out, re.M)
+   and re.search(r"^ +2 +\w{3} \w{3} \d+ +9 PM +GRE - Squash Court B$", out, re.M),
+   "mine lists both bookings, numbered, as day / time / court")
 ok("no upcoming TeXercise reservations" in out, "mine shows the page's notices")
 code, out, err = run("mine", "--json")
 ok([r["can_cancel"] for r in json.loads(out)["reservations"]] == [True, True], "mine --json")
 code, out, err = run("cancel")
-ok(code == 4 and "Say which one" in out, "cancel with no number (no terminal) -> lists, does nothing")
+ok(code == 4 and "utcourts cancel <number>" in out, "cancel with no number (no terminal) -> lists, does nothing")
 code, out, err = run("cancel", "1")
-ok(code == 4 and "Add --yes" in out and len(M.BOOKED) == 2, "cancel without --yes (no terminal) -> nothing cancelled")
+ok(code == 4 and "--yes" in out and len(M.BOOKED) == 2, "cancel without --yes (no terminal) -> nothing cancelled")
 code, out, err = run("cancel", "--match", "9:00 pm", "--dry-run")
-ok(code == 0 and "Would cancel" in out and "9:00 PM" in out and len(M.BOOKED) == 2, "cancel --match --dry-run")
+ok(code == 0 and "Would cancel GRE - Squash Court B" in out and "9 PM" in out and len(M.BOOKED) == 2, "cancel --match --dry-run")
 code, out, err = run("cancel", "--match", "9:00 PM", "--yes")
-ok(code == 0 and "Cancelled: GRE - Squash Court B" in out and "cancelled" in out.lower() and len(M.BOOKED) == 1,
+ok(code == 0 and "Cancelled GRE - Squash Court B" in out and "cancelled" in out.lower() and len(M.BOOKED) == 1,
    "cancel --match --yes -> cancelled, double-checked")
 code, out, err = run("cancel", "--match", "court")
-ok(code == 4 and "Add --yes" in out and "Court A" in out and len(M.BOOKED) == 1,
+ok(code == 4 and "--yes" in out and "Court A" in out and len(M.BOOKED) == 1,
    "--match picks the one left; still needs --yes")
 M.CANCEL_STYLE = "form"
 M.APP_SESSIONS.clear()
@@ -264,7 +286,7 @@ ok(code == 0 and "Cancelled" in out and not M.BOOKED and "Cancel GRE - Squash Co
 code, out, err = run("mine")
 ok("No reservations" in out, "mine is empty afterwards")
 code, out, err = run("cancel", "1", "--yes")
-ok(code == 4 and "no reservations to cancel" in out, "nothing to cancel")
+ok(code == 4 and "no reservations to cancel" in out.lower(), "nothing to cancel")
 M.CANCEL_STYLE = "link"
 
 js_only = ('<html><body><a href="/logout">x</a><ul><li>RSC - Racquetball Court 3 Fri 11/20 7:00 PM '
@@ -294,7 +316,8 @@ print("help")
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     U.main(["help"])
-ok("book" in buf.getvalue() and "cancel" in buf.getvalue() and "exit codes" in buf.getvalue(), "utcourts help")
+ok("book" in buf.getvalue() and "cancel" in buf.getvalue() and "exit code" not in buf.getvalue().lower(),
+   "utcourts help (no exit codes: those are for agents, in SKILL.md)")
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     U.main(["help", "book"])
