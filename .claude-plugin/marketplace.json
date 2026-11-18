@@ -1,0 +1,14 @@
+{
+  "name": "ut-recsports",
+  "description": "UT Austin RecSports tools for Claude Code",
+  "owner": {
+    "name": "Ron Wang"
+  },
+  "plugins": [
+    {
+      "name": "ut-recsports",
+      "source": "./plugins/ut-recsports",
+      "description": "Check, book and cancel UT RecSports courts (squash, racquetball/handball, pickleball, tennis)"
+    }
+  ]
+}

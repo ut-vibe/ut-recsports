@@ -1,0 +1,10 @@
+{
+  "name": "ut-recsports",
+  "description": "Check, book and cancel UT RecSports courts (squash, racquetball/handball, pickleball, tennis)",
+  "version": "1.0.0",
+  "author": {
+    "name": "Ron Wang"
+  },
+  "homepage": "https://github.com/ut-vibe/ut-recsports",
+  "repository": "https://github.com/ut-vibe/ut-recsports"
+}
