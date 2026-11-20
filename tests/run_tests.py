@@ -21,6 +21,7 @@ os.environ["UTCOURTS_BASE_URL"] = f"http://127.0.0.1:{app_port}"
 os.environ["UTCOURTS_HOME"] = tmp_home
 os.environ.setdefault("UTCOURTS_BROWSER", "chromium")  # UTCOURTS_BROWSER=chrome to use installed Chrome
 os.environ["NO_COLOR"] = "1"
+os.environ["PYTHON_KEYRING_BACKEND"] = "fake_keyring.MemoryKeyring"  # never the real Keychain
 sys.path.insert(0, str(HERE.parent / "plugins/ut-recsports/skills/courts/scripts"))
 import utcourts as U  # noqa: E402
 
@@ -323,10 +324,138 @@ with contextlib.redirect_stdout(buf):
     U.main(["help", "book"])
 ok("--dry-run" in buf.getvalue() and "--court" in buf.getvalue(), "utcourts help book")
 
+print("saved password + Duo")
+import keyring  # noqa: E402
+import fake_keyring  # noqa: E402
+ok(isinstance(keyring.get_keyring(), fake_keyring.MemoryKeyring), "tests use the in-memory keyring")
+launches = []
+_real_launch = U._launch
+
+
+def _launch_headless(pw, headless):  # the "window" runs hidden here; the robot on the page types
+    launches.append(headless)
+    return _real_launch(pw, True)
+
+
+U._launch = _launch_headless
+M.SSO_PASSWORD = "hunter2"
+M.HUMAN_AUTOSUBMIT = True
+code, out, err = run("status", "--no-login")
+ok(code == 0, "(still signed in to RecSports and UT's SSO going in)")
+code, out, err = run("login")
+ok(code == 0 and "will be saved in" in err and "utcourts login --no-save-password" in err,
+   "plain login: says up front the password will be saved, and how to opt out")
+ok("Saved your EID and password" in err,
+   "...and saves it, even though you were still signed in (UT is made to ask)")
+M.SSO_ALIVE = False      # from here on, UT asks for the password every time
+ok(U.saved_credentials() == ("abc123", "hunter2"), "EID + password are in the keyring")
+acct = json.loads(Path(tmp_home, "account.json").read_text())
+ok(acct == {"eid": "abc123"} and "hunter2" not in Path(tmp_home, "account.json").read_text(),
+   "account.json holds the EID, not the password")
+ok(oct(os.stat(Path(tmp_home, "account.json")).st_mode & 0o777) == "0o600", "account.json is private (0600)")
+M.HUMAN_AUTOSUBMIT = False
+code, out, err = run("status", "--json", "--no-login")
+ok(json.loads(out)["password_saved"] is True, "status --json says a password is saved")
+
+M.DUO = "push"
+M.APP_SESSIONS.clear()
+logins, prompts = len(M.SSO_LOGINS), M.DUO_PROMPTS
+code, out, err = run("check", "squash", "tomorrow", "--json", "--no-login")
+ok(code == 2 and len(M.SSO_LOGINS) == logins and M.DUO_PROMPTS == prompts,
+   "no terminal (how Claude runs it): never types the password or sends a Duo push")
+ok("saved password" in err and "utcourts login" in err, "...and says utcourts login will use the saved password")
+
+launches.clear()
+code, out, err, asked = run_tty([], "check", "squash", "tomorrow")
+ok(code == 0 and "GRE Squash" in out, f"terminal: session expired -> signed back in (stderr: {err.strip()[-200:]!r})")
+ok(M.SSO_LOGINS[logins:] == [("abc123", "hunter2")], "...typed the saved EID + password, once")
+ok("Approve the Duo push on your phone" in err and M.DUO_PROMPTS == prompts + 1, "...told you to approve the push")
+ok(M.DUO_TRUST_SET, "...and told Duo to trust this browser")
+ok(launches == [True], "...all in the hidden browser, no window")
+
+M.APP_SESSIONS.clear()
+prompts = M.DUO_PROMPTS
+code, out, err, asked = run_tty([], "check", "squash", "tomorrow")
+ok(code == 0 and M.DUO_PROMPTS == prompts and "Approve" not in err,
+   "Duo trusts the browser now: password typed in, no push at all")
+
+M.APP_SESSIONS.clear()
+launches.clear()
+code, out, err = run("login")
+ok(code == 0 and "Signed in" in err and launches == [True], "login without a terminal uses the saved password, hidden")
+
+M.DUO_HONOR_TRUST = False
+M.DUO = "deny"
+M.APP_SESSIONS.clear()
+code, out, err, asked = run_tty([], "check", "squash", "tomorrow")
+ok(code == 2 and "denied" in err.lower(), "Duo push denied -> stops, exit 2, says so")
+
+M.DUO = "code"
+M.APP_SESSIONS.clear()
+
+
+class _TTYErr(io.StringIO):
+    def isatty(self):
+        return True
+
+
+real_stdin = sys.stdin
+sys.stdin, err_buf = _TTY(), _TTYErr()
+try:
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err_buf):
+        code = U.main(["check", "squash", "tomorrow"])
+finally:
+    sys.stdin = real_stdin
+ok(code == 0 and "Duo code 482" in err_buf.getvalue(), "Verified Duo Push: the code is shown in the terminal")
+
+M.DUO = "passcode"
+M.APP_SESSIONS.clear()
+t0 = time.time()
+with contextlib.redirect_stderr(io.StringIO()):
+    done, _ = U.browser_session(interactive=False, timeout_s=60, creds=U.saved_credentials())
+ok(not done and time.time() - t0 < 30, f"a Duo screen it doesn't know -> gives up for the window ({time.time() - t0:.0f}s)")
+
+M.DUO = None
+M.SSO_PASSWORD = "changed-it"
+M.APP_SESSIONS.clear()
+logins = len(M.SSO_LOGINS)
+err_buf = io.StringIO()
+with contextlib.redirect_stderr(err_buf):
+    done, _ = U.browser_session(interactive=False, timeout_s=30, creds=U.saved_credentials())
+ok(not done and len(M.SSO_LOGINS) == logins + 1, "wrong saved password: tried exactly once (no lockouts)")
+ok(U.saved_credentials() is None and "didn't accept the saved password" in err_buf.getvalue()
+   and "incorrect" in err_buf.getvalue(), "...then forgotten, with UT's reason")
+ok(U.saving_passwords() and U.load_account().get("eid") == "abc123",
+   "...but saving stays on, so the next password typed in the window is saved")
+
+U.store_credentials("abc123", "changed-it")
+M.SSO_PASSWORD = None
+M.SSO_ALIVE = True
+M.DUO_HONOR_TRUST = True
+U._launch = _real_launch
+
 print("cli: facilities + logout")
 code, out, err = run("facilities")
 ok(code == 0 and "gre-squash" in out, "facilities list")
 code, out, err = run("logout")
 ok(code == 0 and not Path(tmp_home, "session.json").exists() and not Path(tmp_home, "profile").exists(), "logout wipes both")
+ok("password in" in out and not fake_keyring.MemoryKeyring.store and not Path(tmp_home, "account.json").exists(),
+   "logout also forgets the saved password")
+
+print("opting out of the saved password")
+U._launch = _launch_headless
+M.HUMAN_AUTOSUBMIT = True
+M.SSO_ALIVE = False
+code, out, err = run("login", "--no-save-password")
+ok(code == 0 and "won't save your password" in err and "will be saved" not in err, "login --no-save-password")
+ok(not fake_keyring.MemoryKeyring.store and U.load_account() == {"save_password": False}, "...nothing saved")
+code, out, err = run("logout")
+ok(U.load_account() == {"save_password": False}, "logout keeps the opt-out (no surprise saving next login)")
+code, out, err = run("login", "--save-password")
+ok(code == 0 and U.saved_credentials() == ("abc123", "hunter2"), "login --save-password turns it back on")
+M.HUMAN_AUTOSUBMIT = False
+M.SSO_ALIVE = True
+U._launch = _real_launch
+run("logout")
 
 print(f"\nall {PASS} checks passed")

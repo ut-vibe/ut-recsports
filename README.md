@@ -26,7 +26,7 @@ chmod +x ~/.local/bin/utcourts
 utcourts login           # Chrome window: EID + Duo, once
 ```
 
-You need [uv](https://docs.astral.sh/uv/) (`brew install uv`) and Google Chrome. The script installs its own Python packages on first run. No uv? Run `pip install httpx beautifulsoup4 playwright`, then use `python3 utcourts.py`.
+You need [uv](https://docs.astral.sh/uv/) (`brew install uv`) and Google Chrome. The script installs its own Python packages on first run. No uv? Run `pip install httpx beautifulsoup4 playwright` (add `keyring` to save your password), then use `python3 utcourts.py`.
 
 ## Commands
 
@@ -63,6 +63,16 @@ Commands also take `--json`, for scripts and agents.
 
 `utcourts login` signs you in inside a separate, private Chrome profile (`~/.config/utcourts/`). Its cookies are saved where only your user can read them, so checks are quick plain requests. When the RecSports session expires, it quietly re-signs in through UT's single sign-on in a hidden browser. You only see the sign-in window again once UT's SSO and Duo have fully expired. It saves the SSO cookies itself too, because browsers drop those when they close.
 
+UT's SSO session still runs out after a while, and then it wants your password again. To cover that, utcourts saves the EID and password you type in the sign-in window to your system keychain (the macOS Keychain on a Mac), and only after the sign-in works. The window says so before you type. After that, when UT asks again, the hidden browser types them in for you:
+
+- If Duo still trusts the browser (say yes to "Trust this browser"; UT's lasts about 30 days), that's it. Nothing to do.
+- If Duo wants a push, the terminal says "Approve the Duo push on your phone". You tap approve; no window. With Verified Duo Push it also shows the code to type in.
+- The saved password is only typed in when you run a command yourself in a terminal, or run `utcourts login`. Commands run with `--no-login` or from a script never trigger a push.
+- If UT turns the saved password down (you changed it, say), utcourts forgets it right away and never retries, so it can't lock your account. The next password you type in the window is saved instead.
+- If Duo shows a screen utcourts doesn't recognize, it opens the window as before, with your EID and password already filled in.
+
+Don't want your password saved? Run `utcourts login --no-save-password`. That removes a saved one, stays off (even after `logout`), and `--save-password` turns it back on. `utcourts logout` removes the password from the keychain along with everything else. Keep in mind that while it's saved, anyone who can use your computer account can get as far as Duo as you.
+
 ## Status
 
 - **Checking:** tested against real RecSports pages (the parser test includes one live page with its booking links blanked out).
@@ -85,10 +95,10 @@ To use the skill in just one repo without a plugin, copy `plugins/ut-recsports/s
 
 ## Tests
 
-The suite needs the Python packages and Playwright's own Chromium: `pip install httpx beautifulsoup4 playwright && python3 -m playwright install chromium`.
+The suite needs the Python packages and Playwright's own Chromium: `pip install httpx beautifulsoup4 playwright keyring && python3 -m playwright install chromium`. It uses an in-memory keyring (`tests/fake_keyring.py`), never your real one.
 
 ```bash
-python3 tests/run_tests.py                         # 93 checks against a mock RecSports + UT SSO
+python3 tests/run_tests.py                         # 121 checks against a mock RecSports + UT SSO + Duo
 UTCOURTS_BROWSER=chrome python3 tests/run_tests.py # same, with your installed Chrome
 xvfb-run -a python3 tests/test_login_window.py     # the visible sign-in window (Linux)
 claude plugin validate .                           # marketplace + plugin manifests

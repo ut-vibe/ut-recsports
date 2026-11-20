@@ -3,9 +3,13 @@
 App:  http://127.0.0.1:<app_port>/app/myrecsports/reserve_courts.php
 SSO:  http://localhost:<sso_port>/idp/sso   (a different host, like enterprise.login.utexas.edu)
 
+Duo:  http://duo.localhost:<sso_port>/duo/…  (Chromium sends *.localhost to 127.0.0.1)
+
 Knobs (module globals, flipped by the tests):
   APP_SESSIONS   valid app session ids
   SSO_ALIVE      if True, the SSO auto-signs you back in (no password)
+  SSO_PASSWORD   if set, the only password the SSO accepts
+  DUO            None (no Duo step) | "push" | "code" (Verified Push) | "deny" | "passcode"
 """
 from __future__ import annotations
 
@@ -31,6 +35,13 @@ BOOKED: dict[tuple, int] = {}       # (date, fac, label, court) -> booking id
 BOOK_REQUESTS: list[int] = []       # every reserve request that reached the app
 REFUSE_BOOKING = None               # None | "alert-box" | "js": the site says no
 CANCEL_STYLE = "link"               # "link" (GET) or "form" (POST)
+SSO_PASSWORD = None                 # None = any password works
+SSO_LOGINS: list[tuple[str, str]] = []  # every (EID, password) posted to the SSO
+DUO = None
+DUO_CODE = "482"
+DUO_PROMPTS = 0                     # Duo prompts shown = pushes sent
+DUO_TRUST_SET = False               # someone clicked "Yes, this is my device"
+DUO_HONOR_TRUST = True              # False = Duo asks again even for a trusted browser
 
 # Grids captured from the live site (Wed 11/18/2026). O open, R reserved, P priority,
 # E event, F facility closed, ? reserved with empty tooltip.
@@ -159,11 +170,37 @@ def mine_page(message: str = "") -> str:
 <p>You have no upcoming TeXercise reservations.</p></div></div></div></body></html>"""
 
 
-def login_page() -> str:
-    robot = ("<script>setTimeout(() => document.forms[0].submit(), 1500)</script>" if HUMAN_AUTOSUBMIT else "")
-    return f"""<html><body><h1>UT EID Login</h1>
-<form method="post" action="/idp/login"><input name="j_username"><input type="password" name="j_password">
+def login_page(error: str = "") -> str:
+    robot = ("<script>setTimeout(() => { document.querySelector('[name=j_username]').value = 'abc123';"
+             " document.querySelector('[name=j_password]').value = 'hunter2'; document.forms[0].submit(); }, 1500)"
+             "</script>" if HUMAN_AUTOSUBMIT else "")
+    err = f'<p class="form-error">{error}</p>' if error else ""
+    return f"""<html><body><h1>UT EID Login</h1>{err}
+<form method="post" action="/idp/login"><input name="j_username" id="username"><input type="password" name="j_password">
 <button>Sign in</button></form>{robot}</body></html>"""
+
+
+def duo_page(path: str) -> str:
+    """Duo's Universal Prompt, reduced to the words and ids utcourts looks for."""
+    global DUO_PROMPTS
+    after = "<script>setTimeout(() => location.replace('/duo/{}'), 1200)</script>"
+    if path == "/duo/prompt":
+        DUO_PROMPTS += 1
+        if DUO == "code":
+            return (f'<html><body><h1>Enter code in Duo Mobile</h1><p>Verify it\'s you by entering this code.</p>'
+                    f'<div class="verification-code">{DUO_CODE}</div><p>Sent to "iOS"</p>'
+                    + after.format("approved") + "</body></html>")
+        if DUO == "passcode":
+            return ('<html><body><h1>Enter a passcode</h1><input id="passcode-input" type="text">'
+                    '<button>Verify</button></body></html>')
+        return ('<html><body><h1>Check for a Duo Push</h1><p>Sent to "iOS"</p><a href="#">Other options</a>'
+                + after.format("denied" if DUO == "deny" else "approved") + "</body></html>")
+    if path == "/duo/approved":
+        return ("<html><body><h1>Is this your device?</h1>"
+                "<button id='trust-browser-button' onclick=\"location.href='/duo/trust?yes=1'\">Yes, this is my device</button>"
+                "<button id='dont-trust-browser-button' onclick=\"location.href='/duo/trust'\">No, other people use this device</button>"
+                "</body></html>")
+    return "<html><body><h1>Login request denied</h1><button>Try again</button></body></html>"
 
 
 def autopost_back(target: str) -> str:
@@ -271,17 +308,41 @@ class AppHome(App):
 
 
 class SSO(App):
+    def _signed_in(self):
+        return self._send(200, autopost_back(f"http://127.0.0.1:{APP_PORT}/Shibboleth.sso/SAML2/POST"),
+                          headers={"Set-Cookie": "idp_session=1; path=/; HttpOnly"})
+
     def do_GET(self):
+        global DUO_TRUST_SET
+        u = urlparse(self.path)
+        if self.headers.get("Host", "").startswith("duo.localhost"):
+            REQUEST_LOG.append(f"DUO GET {u.path}")
+            done = {"Location": f"http://localhost:{SSO_PORT}/idp/duo-done"}
+            if u.path == "/duo/prompt" and DUO_HONOR_TRUST and self._cookies().get("duo_trust"):
+                return self._send(302, headers=done)
+            if u.path == "/duo/trust":
+                if "yes=1" in u.query:
+                    DUO_TRUST_SET = True
+                    done["Set-Cookie"] = "duo_trust=1; Max-Age=2592000; path=/; HttpOnly"
+                return self._send(302, headers=done)
+            return self._send(200, duo_page(u.path))
         REQUEST_LOG.append(f"SSO GET {self.path}")
+        if u.path == "/idp/duo-done":
+            return self._signed_in()
         if SSO_ALIVE and self._cookies().get("idp_session"):
             return self._send(200, autopost_back(f"http://127.0.0.1:{APP_PORT}/Shibboleth.sso/SAML2/POST"))
         return self._send(200, login_page())
 
     def do_POST(self):
         REQUEST_LOG.append(f"SSO POST {self.path}")
-        self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        return self._send(200, autopost_back(f"http://127.0.0.1:{APP_PORT}/Shibboleth.sso/SAML2/POST"),
-                          headers={"Set-Cookie": "idp_session=1; path=/; HttpOnly"})
+        body = parse_qs(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode())
+        eid, password = body.get("j_username", [""])[0], body.get("j_password", [""])[0]
+        SSO_LOGINS.append((eid, password))
+        if SSO_PASSWORD is not None and password != SSO_PASSWORD:
+            return self._send(200, login_page("The password you entered was incorrect."))
+        if DUO:
+            return self._send(302, headers={"Location": f"http://duo.localhost:{SSO_PORT}/duo/prompt"})
+        return self._signed_in()
 
 
 def start() -> tuple[int, int]:

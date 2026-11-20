@@ -5,6 +5,7 @@
 #   "httpx>=0.27",
 #   "beautifulsoup4>=4.12",
 #   "playwright>=1.45",
+#   "keyring>=24",
 #   "tzdata; sys_platform == 'win32'",
 # ]
 # ///
@@ -31,13 +32,18 @@ How the "don't make me log in all the time" part works
   profile in a hidden browser. If UT's single sign-on still remembers you, it
   logs back in on its own and the check just continues. You only get asked
   to sign in again when UT's SSO / Duo has fully expired.
+* The EID and password you type in the sign-in window are kept in the system
+  keychain (the macOS Keychain on a Mac). Then when UT asks for your password
+  again, the hidden browser types it in. If Duo still trusts the browser that's
+  the end of it; if not, you approve a Duo push on your phone. No window either
+  way. `login --no-save-password` turns this off and forgets the password.
 
 Human output goes to the terminal; `--json` output and exit codes are for scripts
 and agents (documented in SKILL.md next to this script).
 """
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import argparse
 import json
@@ -79,6 +85,8 @@ HOME = Path(os.environ.get("UTCOURTS_HOME")
             or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "utcourts")
 SESSION_FILE = HOME / "session.json"
 PROFILE_DIR = HOME / "profile"
+ACCOUNT_FILE = HOME / "account.json"   # {"eid", "save_password"?}; the password itself is in the keychain
+KEYRING_SERVICE = "utcourts"
 
 DEFAULT_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -133,6 +141,10 @@ class UTCourtsError(Exception):
 class SignInNeeded(UTCourtsError):
     exit_code = 2
     default_hint = "Run utcourts login to sign in with your EID + Duo."
+
+
+class DuoFailed(SignInNeeded):
+    default_hint = "Run utcourts login to try again."
 
 
 class PageChanged(UTCourtsError):
@@ -246,6 +258,20 @@ def log(msg: str) -> None:
     with sp.lock:
         sys.stderr.write("\r\033[2K" + msg + "\n")
         sys.stderr.flush()
+
+
+def tell(msg: str) -> None:
+    """A passing status: the spinner's text if one is showing, else its own line."""
+    if not Spinner.say(msg):
+        log(Paint(sys.stderr).note(msg))
+
+
+def someone_watching() -> bool:
+    """True if stderr is a terminal, so a message printed now is seen now."""
+    try:
+        return sys.stderr.isatty()
+    except (AttributeError, ValueError):
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -477,21 +503,124 @@ def save_session(cookies: list[dict], user_agent: str | None,
     browser_cookies: the hidden browser's full jar (incl. UT SSO). Browsers throw away
     "session" cookies when they close, and SSO cookies are usually that kind, so we keep
     them here and put them back on the next launch — that's what makes quiet re-login work."""
+    if browser_cookies is None:
+        browser_cookies = (load_session() or {}).get("browser_cookies", [])
+    _write_private(SESSION_FILE, {"saved_at": datetime.now().isoformat(timespec="seconds"),
+                                  "user_agent": user_agent or DEFAULT_UA, "cookies": cookies,
+                                  "browser_cookies": browser_cookies})
+
+
+def _write_private(path: Path, data: dict) -> None:
+    """Write JSON that only this user can read (0600, in a 0700 folder)."""
     HOME.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(HOME, 0o700)
     except OSError:
         pass
-    if browser_cookies is None:
-        browser_cookies = (load_session() or {}).get("browser_cookies", [])
-    data = {"saved_at": datetime.now().isoformat(timespec="seconds"),
-            "user_agent": user_agent or DEFAULT_UA, "cookies": cookies,
-            "browser_cookies": browser_cookies}
-    tmp = SESSION_FILE.with_suffix(".tmp")
+    tmp = path.with_suffix(".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:
         json.dump(data, fh, indent=1)
-    os.replace(tmp, SESSION_FILE)
+    os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------- #
+# Saved password (on unless `login --no-save-password`). The EID and the setting live in
+# account.json; the password lives in the system keychain via the `keyring` package.
+# --------------------------------------------------------------------------- #
+def load_account() -> dict:
+    try:
+        data = json.loads(ACCOUNT_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_account(data: dict) -> None:
+    _write_private(ACCOUNT_FILE, data)
+
+
+def saving_passwords() -> bool:
+    """True unless turned off with `login --no-save-password` (then save_password is False)."""
+    return load_account().get("save_password", True) is not False
+
+
+def can_save_passwords() -> bool:
+    return saving_passwords() and keyring_problem() is None
+
+
+def _keyring():
+    try:
+        import keyring
+    except ImportError:
+        return None
+    return keyring
+
+
+def keychain_name() -> str:
+    if sys.platform == "darwin":
+        return "the macOS Keychain"
+    if os.name == "nt":
+        return "Windows Credential Manager"
+    return "your system keyring"
+
+
+def keyring_problem() -> str | None:
+    """Why a password can't be saved here, or None if it can."""
+    kr = _keyring()
+    if kr is None:
+        return "Saving a password needs the keyring package (uv installs it; or: pip install keyring)."
+    try:
+        from keyring.backends import fail
+        if isinstance(kr.get_keyring(), fail.Keyring):
+            return "This computer has no system keyring for utcourts to keep a password in."
+    except Exception as ex:
+        return f"Couldn't open {keychain_name()}: {ex}"
+    return None
+
+
+def saved_credentials() -> tuple[str, str] | None:
+    """The saved (EID, password), or None."""
+    eid = load_account().get("eid")
+    kr = _keyring() if eid and saving_passwords() else None
+    if kr is None:
+        return None
+    try:
+        password = kr.get_password(KEYRING_SERVICE, eid)
+    except Exception:
+        return None
+    return (eid, password) if password else None
+
+
+def store_credentials(eid: str, password: str) -> bool:
+    kr = _keyring()
+    if kr is None:
+        return False
+    acct = load_account()
+    try:
+        kr.set_password(KEYRING_SERVICE, eid, password)
+    except Exception as ex:
+        log(Paint(sys.stderr).warn(f"Couldn't save your password in {keychain_name()}: {ex}"))
+        return False
+    if acct.get("eid") and acct["eid"] != eid:
+        _delete_password(kr, acct["eid"])
+    acct["eid"] = eid
+    save_account(acct)
+    return True
+
+
+def _delete_password(kr, eid: str) -> bool:
+    try:
+        kr.delete_password(KEYRING_SERVICE, eid)
+        return True
+    except Exception:
+        return False
+
+
+def forget_password() -> bool:
+    """Remove the saved password (the EID and the setting stay)."""
+    eid, kr = load_account().get("eid"), _keyring()
+    return bool(eid and kr and _delete_password(kr, eid))
 
 
 def _cookie_applies(c: dict, host: str) -> bool:
@@ -646,8 +775,13 @@ def fetch_many(jobs: list[tuple[date, int]]) -> list[DayResult]:
 
 def with_client(action, allow_login: bool):
     """Run action(client): fast path first; on an expired session, quiet SSO re-login in the
-    hidden browser and run it there; if UT wants a human, open a window (when allowed)."""
+    hidden browser and run it there; if UT wants a human, open a window (when allowed).
+
+    A saved password is only typed in when allow_login is set (someone is at the terminal),
+    because it can set off a Duo push, and a push nobody is expecting is a bad habit to teach."""
     sess = load_session()
+    creds = saved_credentials() if allow_login else None
+    tried_quiet = False
     if sess and sess.get("cookies"):
         client = HttpClient(sess)
         try:
@@ -656,21 +790,23 @@ def with_client(action, allow_login: bool):
             pass
         finally:
             client.close()
-        msg = "RecSports session expired. Trying to sign back in quietly…"
-        if not Spinner.say(msg):
-            log(Paint(sys.stderr).note(msg))
-        ok, value = browser_session(interactive=False, timeout_s=30, action=action)
-        if ok:
-            return value
-    elif PROFILE_DIR.exists():
-        ok, value = browser_session(interactive=False, timeout_s=30, action=action)
+        tell("RecSports session expired. Trying to sign back in quietly…")
+    if (sess and sess.get("cookies")) or PROFILE_DIR.exists():
+        ok, value = browser_session(interactive=False, timeout_s=120 if creds else 30, action=action, creds=creds)
+        tried_quiet = True
         if ok:
             return value
     elif not allow_login:
         raise SignInNeeded("Not signed in yet.")
     if allow_login:
-        return interactive_login(action)
-    raise SignInNeeded("Your UT sign-in has expired.")
+        return interactive_login(action, quiet_first=not tried_quiet)
+    raise SignInNeeded("Your UT sign-in has expired.", hint=sign_in_hint())
+
+
+def sign_in_hint() -> str:
+    if saved_credentials():
+        return "Run utcourts login. It types in your saved password; approve the Duo push if one comes."
+    return SignInNeeded.default_hint
 
 
 def get_results(jobs: list[tuple[date, int]], allow_login: bool) -> list[DayResult]:
@@ -737,21 +873,196 @@ def remember_browser(ctx, user_agent: str | None) -> None:
 def _needs_user(page) -> bool:
     """True if the page is waiting for a human (password box or Duo prompt)."""
     try:
-        if any("duosecurity.com" in (fr.url or "") or "duo" in (urlparse(fr.url or "").hostname or "")
-               for fr in page.frames):
+        if any(_is_duo(urlparse(fr.url or "").hostname) for fr in page.frames):
             return True
-        pw_box = page.query_selector("input[type=password]")
-        return bool(pw_box and pw_box.is_visible())
+        return _password_box(page) is not None
     except Exception:
         return False
 
 
-def browser_session(interactive: bool, timeout_s: float, action=None) -> tuple[bool, object]:
+def _is_duo(host: str | None) -> bool:
+    return "duo" in (host or "")  # api-xxxx.duosecurity.com
+
+
+def _password_box(page):
+    box = page.query_selector("input[type=password]")
+    return box if box and box.is_visible() else None
+
+
+def _fill_sign_in(page, box, creds: tuple[str, str]) -> None:
+    eid, password = creds
+    user = page.query_selector("input[name=j_username], input#username")
+    if user and user.is_visible() and user.is_editable():
+        user.fill(eid)
+    box.fill(password)
+    box.press("Enter")  # submits with the form's own "Sign in" button
+
+
+def _sign_in_error(page) -> str:
+    """The sign-in page's own error line, if it shows one."""
+    for el in page.query_selector_all(".form-error, .output--error, .error, .alert, [role=alert]"):
+        try:
+            text = " ".join(el.inner_text().split())
+        except Exception:
+            continue
+        if text and el.is_visible():
+            return text
+    return ""
+
+
+def _watch_sign_in_form(ctx) -> dict:
+    """Remember the EID and password sent to UT's sign-in form in this browser, so they can be
+    saved once the sign-in works. Reads the form post itself, so nothing is injected into the page."""
+    typed: dict = {}
+
+    def on_request(req) -> None:
+        try:
+            if req.method != "POST" or urlparse(req.url).hostname == APP_HOST:
+                return
+            body = req.post_data or ""
+        except Exception:
+            return
+        if "j_password=" not in body:
+            return
+        q = parse_qs(body)
+        eid, password = (q.get("j_username") or [""])[0].strip(), (q.get("j_password") or [""])[0]
+        if eid and password:
+            typed.update(eid=eid, password=password)
+
+    ctx.on("request", on_request)
+    return typed
+
+
+def _save_typed(typed: dict | None, creds: tuple[str, str] | None) -> None:
+    if not typed or not saving_passwords():
+        return
+    problem = keyring_problem()
+    if problem:
+        if load_account().get("save_password") is True:  # asked for with --save-password
+            log(Paint(sys.stderr).warn(problem))
+        return
+    pair = (typed["eid"], typed["password"])
+    if pair != creds and store_credentials(*pair):
+        log(Paint(sys.stderr).ok(f"Saved your EID and password in {keychain_name()}"))
+
+
+# Duo's Universal Prompt (api-xxxx.duosecurity.com/frame/frameless/v4/…). Read by its
+# words as well as its ids so a redesign degrades to "open the window", not to a hang.
+_DUO_TRUST = re.compile(r"is this your device|trust this browser", re.I)
+_DUO_FAILED = re.compile(r"\b(denied|declined|timed out|locked out|expired)\b", re.I)
+_DUO_PUSHED = re.compile(r"check for a duo push|sent to\b|approve (the|this) (notification|request|push)", re.I)
+_DUO_CODE_WORDS = re.compile(r"enter (the |this )?(verification )?code", re.I)
+
+
+def _visible(page, selector: str):
+    el = page.query_selector(selector)
+    return el if el and el.is_visible() else None
+
+
+def _duo_screen(page) -> tuple[str, str]:
+    """What Duo is showing: trust / code / failed / push / other, plus a detail."""
+    if _visible(page, "#trust-browser-button"):
+        return "trust", ""
+    code = _visible(page, ".verification-code")
+    if code:
+        return "code", code.inner_text().strip()
+    text = page.inner_text("body")
+    if _DUO_TRUST.search(text):
+        return "trust", ""
+    if _DUO_CODE_WORDS.search(text):
+        m = re.search(r"^\s*(\d{3,6})\s*$", text, re.M)
+        if m:
+            return "code", m.group(1)
+    bad = next((" ".join(line.split()) for line in text.splitlines() if _DUO_FAILED.search(line)), "")
+    if bad:
+        return "failed", bad
+    if _visible(page, "input#passcode-input, input[name=passcode]"):
+        return "other", ""
+    if _DUO_PUSHED.search(text):
+        return "push", ""
+    return "other", ""
+
+
+def _click_first(page, *locators) -> bool:
+    from playwright.sync_api import Error as PWError
+    for loc in locators:
+        try:
+            if loc.count() and loc.first.is_visible():
+                loc.first.click(timeout=3000)
+                return True
+        except PWError:
+            pass
+    return False
+
+
+class _DuoWatch:
+    """Gets a hidden-browser sign-in through Duo: tells the person about the push (and the
+    code, for Verified Push), and says yes to "trust this browser" (it's utcourts' own
+    profile). step() returns False when a person has to see the page after all."""
+
+    def __init__(self):
+        self.progress_at: float | None = None  # last time Duo showed something we understood
+        self.announced: str | None = None
+        self.trust_at = 0.0
+        self.nudges = 0
+
+    def step(self, page) -> bool:
+        now = time.monotonic()
+        if self.progress_at is None:
+            self.progress_at = now  # Duo just showed up
+        state, detail = _duo_screen(page)
+        e = Paint(sys.stderr)
+        if state == "failed":
+            raise DuoFailed(f"Duo: {detail}")
+        if state == "trust":
+            if now - self.trust_at > 2:
+                self.trust_at = now
+                _click_first(page, page.locator("#trust-browser-button"),
+                             page.get_by_role("button", name=re.compile(r"^\s*(yes|trust)", re.I)))
+        elif state == "code":
+            if not someone_watching():
+                return False  # the code has to be read off a screen; the window will show it
+            if self.announced != detail:
+                self.announced = detail
+                log(e.note(f"Duo code {e(detail, 'bold')}: approve the push on your phone and type in that code."))
+                Spinner.say("Waiting for Duo…")
+        elif state == "push":
+            if self.announced is None:
+                self.announced = "push"
+                log(e.note("Approve the Duo push on your phone."))
+                Spinner.say("Waiting for Duo…")
+        else:  # still loading, a list of methods, a passcode box, or something new
+            if now - self.progress_at > 15:
+                return False
+            if now - self.progress_at > 4 and self.nudges < 2:
+                push = re.compile(r"duo push|send (me )?a push", re.I)
+                other = re.compile(r"^\s*other options\s*$", re.I)
+                if _click_first(page, page.get_by_role("button", name=push), page.get_by_role("link", name=push),
+                                page.get_by_role("button", name=other), page.get_by_role("link", name=other)):
+                    self.nudges += 1
+                    self.progress_at = now
+            return True
+        self.progress_at = now
+        return True
+
+
+def browser_session(interactive: bool, timeout_s: float, action=None,
+                    creds: tuple[str, str] | None = None, fresh: bool = False) -> tuple[bool, object]:
     """Open the private profile and get to the court page (signing in via SSO if needed).
+
+    creds: a saved (EID, password). When UT shows its password form they're typed in, once.
+    If UT turns them down, the password is forgotten, so a stale one can't lock the account.
+    In the hidden browser, creds also mean Duo may be used: the push is announced on stderr
+    and "trust this browser" is answered yes. Without creds, the hidden browser gives up as
+    soon as UT wants a password or Duo.
+
+    fresh: start signed out of RecSports and UT's SSO (Duo's cookies stay, so a trusted
+    browser stays trusted), so UT asks for the password. For `login --save-password`.
 
     On success: saves the cookies for the fast path, runs `action(BrowserClient)` from inside
     the browser (so it works even if exported cookies ever stop working), and returns
-    (True, its result). Returns (False, None) if a human is needed.
+    (True, its result). Returns (False, None) if a human is needed. Raises DuoFailed if Duo
+    said no (denied, timed out).
     """
     try:
         from playwright.sync_api import sync_playwright, Error as PWError
@@ -763,6 +1074,12 @@ def browser_session(interactive: bool, timeout_s: float, action=None) -> tuple[b
         ctx = _launch(pw, headless=not interactive)
         try:
             restore_browser_cookies(ctx)
+            if fresh:
+                duo_cookies = [c for c in ctx.cookies() if _is_duo(c.get("domain", "").lstrip("."))]
+                ctx.clear_cookies()
+                if duo_cookies:
+                    ctx.add_cookies([{k: c[k] for k in _PW_COOKIE_KEYS if k in c} for c in duo_cookies])
+            typed = _watch_sign_in_form(ctx) if saving_passwords() else None
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             ua = None
             try:
@@ -772,6 +1089,10 @@ def browser_session(interactive: bool, timeout_s: float, action=None) -> tuple[b
             if ua and "Headless" in ua:
                 ua = ua.replace("HeadlessChrome", "Chrome")
                 ctx.set_extra_http_headers({"User-Agent": ua})
+                try:  # the page's own JS sees it too (Duo looks at the browser)
+                    ctx.new_cdp_session(page).send("Emulation.setUserAgentOverride", {"userAgent": ua})
+                except Exception:
+                    pass
             try:
                 page.goto(COURTS_URL, wait_until="domcontentloaded", timeout=30_000)
             except PWError as e:
@@ -782,6 +1103,8 @@ def browser_session(interactive: bool, timeout_s: float, action=None) -> tuple[b
             human_since: float | None = None
             last_url, url_since = "", time.monotonic()
             nudged = False
+            filled_at: float | None = None  # when the saved password was typed in
+            duo = _DuoWatch()
             while time.monotonic() < deadline:
                 if page.is_closed():
                     if interactive:
@@ -794,6 +1117,7 @@ def browser_session(interactive: bool, timeout_s: float, action=None) -> tuple[b
                         last_url, url_since = url, time.monotonic()
                     if host == APP_HOST and page.query_selector("#form_courts"):
                         remember_browser(ctx, ua or page.evaluate("navigator.userAgent"))
+                        _save_typed(typed, creds)
                         value = action(BrowserClient(ctx)) if action else None
                         remember_browser(ctx, ua or page.evaluate("navigator.userAgent"))
                         return True, value
@@ -804,16 +1128,42 @@ def browser_session(interactive: bool, timeout_s: float, action=None) -> tuple[b
                             nudged = True
                             page.goto(COURTS_URL, wait_until="domcontentloaded", timeout=30_000)
                             continue
-                    if not interactive:
-                        if _needs_user(page):
-                            human_since = human_since or time.monotonic()
-                            if time.monotonic() - human_since > 2.5:
-                                return False, None  # UT wants a password / Duo: needs a human
-                        else:
-                            human_since = None
-                        # SSO redirect chains don't sit still; a login page waiting for a human does.
-                        if host != APP_HOST and time.monotonic() - url_since > 8:
+                    box = _password_box(page) if creds and host != APP_HOST and not _is_duo(host) else None
+                    if box and filled_at is None:
+                        if not interactive:
+                            tell("Signing in with your saved password…")
+                        _fill_sign_in(page, box, creds)
+                        filled_at = time.monotonic()
+                        continue
+                    if box and time.monotonic() - filled_at > 1.5 and not box.input_value():
+                        # UT showed the form again: it turned the password down. Never retry it.
+                        why = _sign_in_error(page)
+                        forget_password()
+                        creds = None
+                        e = Paint(sys.stderr)
+                        log(e.warn("UT didn't accept the saved password" + (f" ({why})" if why else "")
+                                   + f", so utcourts removed it from {keychain_name()}."))
+                        log("  It saves the new one the next time you sign in in the window.")
+                        if not interactive:
                             return False, None
+                        continue
+                    if not interactive:
+                        if creds and _is_duo(host):
+                            if not duo.step(page):
+                                return False, None
+                            human_since = None
+                        elif creds and filled_at and time.monotonic() - filled_at < 10:
+                            pass  # the saved password is on its way to UT
+                        else:
+                            if _needs_user(page):
+                                human_since = human_since or time.monotonic()
+                                if time.monotonic() - human_since > 2.5:
+                                    return False, None  # UT wants a password / Duo: needs a human
+                            else:
+                                human_since = None
+                            # SSO redirect chains don't sit still; a login page waiting for a human does.
+                            if host != APP_HOST and time.monotonic() - url_since > 8:
+                                return False, None
                 except PWError:
                     pass  # mid-navigation; try again
                 page.wait_for_timeout(400)
@@ -825,19 +1175,36 @@ def browser_session(interactive: bool, timeout_s: float, action=None) -> tuple[b
                 pass
 
 
-def interactive_login(action=None):
+def interactive_login(action=None, quiet_first: bool = True, fresh: bool = False):
+    """Sign in for someone who asked to: with a saved password, in the hidden browser (only
+    Duo needs them); otherwise, or if that can't finish, in a visible Chrome window.
+    fresh: make UT ask for the password in the window (see browser_session)."""
     e = Paint(sys.stderr)
-    log(e.note("Opening a Chrome window. Sign in there with your UT EID and Duo."))
+    home = str(HOME).replace(str(Path.home()), "~", 1)
+    creds = saved_credentials()
+    if creds and quiet_first:
+        with Spinner("Signing in with your saved password…"):
+            ok, value = browser_session(interactive=False, timeout_s=120, action=action, creds=creds)
+        if ok:
+            log(e.ok("Signed in") + e(f" · session saved in {home}", "dim"))
+            return value
+        creds = saved_credentials()  # gone if UT turned it down
+    if creds:
+        log(e.note("Opening a Chrome window to finish signing in. Your saved EID and password are filled in."))
+    else:
+        log(e.note("Opening a Chrome window. Sign in there with your UT EID and Duo."))
+        if can_save_passwords():
+            log(e(f"  The EID and password you type there will be saved in {keychain_name()}, so next time", "dim"))
+            log(e("  only Duo needs you. Don't want that? utcourts login --no-save-password", "dim"))
     log(e("  If Duo offers “Trust this browser”, say yes and you'll stay signed in longer.", "dim"))
     waiting = "Waiting for you to sign in…"
     if Spinner.say(waiting):
-        ok, value = browser_session(interactive=True, timeout_s=300, action=action)
+        ok, value = browser_session(interactive=True, timeout_s=300, action=action, creds=creds, fresh=fresh)
     else:
         with Spinner(waiting):
-            ok, value = browser_session(interactive=True, timeout_s=300, action=action)
+            ok, value = browser_session(interactive=True, timeout_s=300, action=action, creds=creds, fresh=fresh)
     if not ok:
         raise SignInNeeded("Didn't finish signing in within 5 minutes.", hint="Run utcourts login to try again.")
-    home = str(HOME).replace(str(Path.home()), "~", 1)
     log(e.ok("Signed in") + e(f" · session saved in {home}", "dim"))
     return value
 
@@ -1271,7 +1638,21 @@ def cmd_check(args) -> int:
 
 
 def cmd_login(args) -> int:
-    interactive_login()
+    e = Paint(sys.stderr)
+    acct = load_account()
+    if args.save_password is True:
+        problem = keyring_problem()
+        if problem:
+            raise UTCourtsError(problem)
+        save_account({**acct, "save_password": True})
+    elif args.save_password is False:
+        forgot = forget_password()
+        acct.pop("eid", None)
+        save_account({**acct, "save_password": False})
+        log(e.ok("utcourts won't save your password" + (f"; removed it from {keychain_name()}" if forgot else "")))
+    saving = can_save_passwords()
+    # Nothing saved yet: have UT ask for the password, so there's something to save.
+    interactive_login(fresh=saving and saved_credentials() is None)
     # Make sure the quick (no-browser) path works with the saved cookies.
     try:
         with Spinner("Checking the saved session…"):
@@ -1280,6 +1661,9 @@ def cmd_login(args) -> int:
         e = Paint(sys.stderr)
         log(e.warn("RecSports didn't accept the saved cookies outside the browser."))
         log("  Checks still work; they go through a hidden browser, which is a bit slower.")
+    if saving and not saved_credentials():
+        log(e.warn("UT didn't ask for your password this time (you were still signed in), so it isn't saved yet."))
+        log("  utcourts saves it the next time you sign in in the window.")
     return 0
 
 
@@ -1295,9 +1679,12 @@ def cmd_status(args) -> int:
     p = Paint(sys.stdout)
     sess = load_session()
 
+    password_saved = saved_credentials() is not None
+
     def report(signed_in: bool, text: str) -> None:
         if args.json:
-            print(json.dumps({"signed_in": signed_in, "saved_at": (sess or {}).get("saved_at")}, indent=2))
+            print(json.dumps({"signed_in": signed_in, "saved_at": (sess or {}).get("saved_at"),
+                              "password_saved": password_saved}, indent=2))
         elif not (args.quiet and signed_in):
             print(text)
 
@@ -1307,12 +1694,14 @@ def cmd_status(args) -> int:
     try:
         with Spinner("Checking the saved session…", enabled=not args.json):
             fetch_many([(austin_today(), 35)])
-        report(True, p.ok("Signed in") + p(f" · session saved {_saved_at(sess)}", "dim"))
+        report(True, p.ok("Signed in") + p(f" · session saved {_saved_at(sess)}"
+                                            + (" · password saved" if password_saved else ""), "dim"))
         return 0
     except SignInNeeded:
         if args.refresh:
+            creds = saved_credentials() if args.login and sys.stdin.isatty() else None
             with Spinner("Signing back in quietly…", enabled=not args.json):
-                ok = browser_session(interactive=False, timeout_s=30)[0]
+                ok = browser_session(interactive=False, timeout_s=120 if creds else 30, creds=creds)[0]
             if ok:
                 report(True, p.ok("Signed back in quietly"))
                 return 0
@@ -1324,16 +1713,26 @@ def cmd_status(args) -> int:
 
 
 def cmd_logout(args) -> int:
-    removed = False
+    removed = []
     if SESSION_FILE.exists():
         SESSION_FILE.unlink()
-        removed = True
+        removed.append("session")
     if PROFILE_DIR.exists():
         shutil.rmtree(PROFILE_DIR, ignore_errors=True)
-        removed = True
+        removed.append("browser profile")
+    if ACCOUNT_FILE.exists():
+        if forget_password():
+            removed.append(f"password in {keychain_name()}")
+        if saving_passwords():
+            ACCOUNT_FILE.unlink()
+        else:
+            save_account({"save_password": False})  # someone who opted out stays opted out
     p = Paint(sys.stdout)
-    print(p.ok("Signed out") + p(" · removed the saved session and browser profile", "dim")
-          if removed else "Already signed out.")
+    if not removed:
+        print("Already signed out.")
+        return 0
+    what = removed[0] if len(removed) == 1 else ", ".join(removed[:-1]) + " and " + removed[-1]
+    print(p.ok("Signed out") + p(f" · removed the saved {what}", "dim"))
     return 0
 
 
@@ -1879,10 +2278,18 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     x.set_defaults(func=cmd_cancel)
     subs["cancel"] = x
 
-    lg = sub.add_parser("login", usage="utcourts login",
+    lg = sub.add_parser("login", usage="utcourts login [--no-save-password]",
                         description="Sign in with your UT EID + Duo in a separate Chrome window. After that,\n"
-                                    "utcourts signs itself back in quietly until UT asks for Duo again.")
-    lg.set_defaults(func=cmd_login)
+                                    "utcourts signs itself back in quietly until UT asks for Duo again.\n\n"
+                                    "The EID and password you type in the window are kept in the system\n"
+                                    "keychain. When UT asks for them again, utcourts types them in without a\n"
+                                    "window, and you approve the Duo push on your phone (if Duo still trusts\n"
+                                    "the browser, not even that). `utcourts logout` forgets them.")
+    lg.add_argument("--no-save-password", dest="save_password", action="store_false",
+                    help="don't keep your password (and forget a saved one); sticks until --save-password")
+    lg.add_argument("--save-password", dest="save_password", action="store_true",
+                    help="turn saving back on")
+    lg.set_defaults(func=cmd_login, save_password=None)
     subs["login"] = lg
 
     st = sub.add_parser("status", usage="utcourts status [--refresh] [-q]",

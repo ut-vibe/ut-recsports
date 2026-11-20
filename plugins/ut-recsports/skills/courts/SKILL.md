@@ -22,7 +22,7 @@ uv run "${CLAUDE_SKILL_DIR}/scripts/utcourts.py" <command> ... --json --no-login
 ```
 
 No `uv`? Use `python3 "${CLAUDE_SKILL_DIR}/scripts/utcourts.py"` after
-`pip install httpx beautifulsoup4 playwright`. `utcourts.py help <command>` prints the details.
+`pip install httpx beautifulsoup4 playwright keyring`. `utcourts.py help <command>` prints the details.
 
 ### Check
 `check <sport|facility...> <date> [--after 5pm] [--before 9pm] [--days N]`
@@ -55,7 +55,7 @@ No `uv`? Use `python3 "${CLAUDE_SKILL_DIR}/scripts/utcourts.py"` after
    JavaScript; send the person to the My Reservations page).
 
 ### Status
-`status --json --no-login` returns `{"signed_in": true|false, "saved_at": "..."}`.
+`status --json --no-login` returns `{"signed_in": true|false, "saved_at": "...", "password_saved": true|false}`.
 
 ### Exit codes and signing in
 The human output never mentions these; they're for you.
@@ -68,8 +68,16 @@ The human output never mentions these; they're for you.
 | `3` | network trouble, or the RecSports page changed | retry once; then tell the person |
 | `4` | nothing was done: not open, ambiguous, not confirmed, or RecSports said no | read the JSON `status` |
 
-On `2`: tell the person a Chrome window is about to open for their EID and Duo, then run
-`uv run "${CLAUDE_SKILL_DIR}/scripts/utcourts.py" login` (no `--json`; it waits up to 5 minutes). Then retry.
+On `2`, run `status --json --no-login` and look at `password_saved`:
+- `true`: tell the person utcourts will sign in with their saved password and they may get a Duo push
+  to approve on their phone (a Chrome window opens only if Duo shows something unusual). Then run
+  `uv run "${CLAUDE_SKILL_DIR}/scripts/utcourts.py" login` (no `--json`; it waits up to 2 minutes for Duo).
+- `false`: tell the person a Chrome window is about to open for their EID and Duo, and that utcourts
+  saves the EID and password they type there in the macOS Keychain so later sign-ins only need Duo
+  (if they don't want that, run `login --no-save-password` instead). Then run the same `login`
+  (it waits up to 5 minutes).
+
+Then retry. With `--no-login`, commands never type in the saved password, so they never set off a push.
 
 Without a terminal, `book` and `cancel` never prompt: they stop with `not_confirmed` unless you pass
 `--yes`, which you only do after the person said yes to that exact slot or reservation.
